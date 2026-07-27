@@ -95,6 +95,8 @@ class WorkerConfig:
     reply_delay: float = 0.0
     network_delay: float = 0.0
     result_ack_timeout: float = 2.0
+    result_payload_bytes: int = 0
+    payload_seed: int = 0
     zmq_options: ZmqSocketOptions = field(default_factory=ZmqSocketOptions)
     monitor_enabled: bool = True
     log_level: str = "INFO"
@@ -123,6 +125,8 @@ class ScenarioConfig:
     monitor_enabled: bool = True
     timeline_enabled: bool = True
     report_path: str = ""
+    result_payload_bytes: int = 0
+    payload_jitter: float = 0.0
 
 
 @dataclass
@@ -146,6 +150,8 @@ class CampaignConfig:
     report_path: str = "campaign_report.json"
     print_timelines: bool = False
     verbose: bool = False
+    avg_payload_bytes: int = 20 * 1024 * 1024
+    payload_jitter: float = 0.15
 
 
 def apply_production_timings(cfg: BrokerConfig | WorkerConfig) -> None:

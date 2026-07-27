@@ -23,6 +23,7 @@ from config import (
     ZmqSocketOptions,
 )
 from logging_setup import setup_logging
+from payload_utils import jitter_payload_bytes, payload_timeout_bonus
 from timeline import (
     RunOutcome,
     TimelineCollector,
@@ -75,6 +76,7 @@ class RunResult:
     result_ack_received: bool = False
     transport_case: str = ""
     job_id: str = ""
+    payload_bytes: int = 0
 
 
 @dataclass
@@ -157,6 +159,16 @@ def run_single_scenario(
     reconnect_delay = apply_jitter(rng, scenario.reconnect_delay, cfg.jitter)
     reply_delay = apply_jitter(rng, scenario.reply_delay, cfg.jitter)
     network_delay = apply_jitter(rng, scenario.network_delay, cfg.jitter)
+    if cfg.result_payload_bytes > 0:
+        result_payload_bytes = jitter_payload_bytes(
+            rng, cfg.result_payload_bytes, cfg.payload_jitter
+        )
+    else:
+        result_payload_bytes = 0
+    payload_seed = (cfg.seed or 0) + run_index
+    scenario_timeout = cfg.scenario_timeout + payload_timeout_bonus(
+        result_payload_bytes
+    )
     log_level = "ERROR" if quiet else "INFO"
 
     timeline = TimelineCollector(run_id=run_id, enabled=cfg.timeline_enabled)
@@ -190,6 +202,8 @@ def run_single_scenario(
         reply_delay=reply_delay,
         network_delay=network_delay,
         result_ack_timeout=1.0,
+        result_payload_bytes=result_payload_bytes,
+        payload_seed=payload_seed,
         zmq_options=ZmqSocketOptions(
             immediate=scenario.zmq_immediate or cfg.zmq_immediate,
             linger=cfg.zmq_linger,
@@ -209,7 +223,7 @@ def run_single_scenario(
         try:
             stats = broker.run_once(
                 auto_dispatch=True,
-                timeout=cfg.scenario_timeout,
+                timeout=scenario_timeout,
             )
             broker_stats_holder.append(stats)
         except Exception as exc:
@@ -224,7 +238,7 @@ def run_single_scenario(
     worker = Worker(worker_cfg, timeline=timeline, run_id=run_id)
     worker_stats = worker.run()
 
-    bt.join(timeout=cfg.scenario_timeout + 3)
+    bt.join(timeout=scenario_timeout + 3)
     if broker_error:
         log.error("Broker error: %s", broker_error[0])
 
@@ -266,6 +280,7 @@ def run_single_scenario(
         result_ack_received=worker_stats.result_ack_received,
         transport_case=transport.value,
         job_id=outcome.job_id,
+        payload_bytes=result_payload_bytes,
     )
 
 
@@ -322,6 +337,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=20)
     parser.add_argument("--jitter", type=float, default=0.0)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument(
+        "--result-payload-bytes",
+        type=int,
+        default=0,
+        help="Taille moyenne du payload RESULT (0 = léger, ex: 20971520 pour ~20 Mo)",
+    )
+    parser.add_argument(
+        "--payload-jitter",
+        type=float,
+        default=0.15,
+        help="Jitter relatif sur la taille du payload",
+    )
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--result-policy", choices=["strict", "job-id"], default="strict")
     parser.add_argument(
@@ -371,6 +398,8 @@ def main() -> None:
         seed=seed,
         monitor_enabled=not args.no_monitor,
         report_path=args.report,
+        result_payload_bytes=args.result_payload_bytes,
+        payload_jitter=args.payload_jitter,
     )
 
     scenarios = DEFAULT_SCENARIOS
@@ -381,7 +410,8 @@ def main() -> None:
     print(
         f"Running {args.runs} iterations per scenario (seed={seed}) "
         f"(heartbeat={heartbeat_interval}s, timeout={worker_timeout}s, "
-        f"job={base_job_duration}s, jitter={args.jitter})"
+        f"job={base_job_duration}s, jitter={args.jitter}, "
+        f"payload={args.result_payload_bytes}B±{args.payload_jitter:.0%})"
     )
     print()
 

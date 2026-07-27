@@ -41,8 +41,20 @@ class Message:
     timestamp: float = field(default_factory=time.time)
     heartbeat_counter: int = 0
     payload: dict[str, Any] = field(default_factory=dict)
+    binary_data: bytes = field(default=b"", repr=False)
+
+    @property
+    def payload_bytes(self) -> int:
+        declared = self.payload.get("payload_bytes")
+        if isinstance(declared, int) and declared > 0:
+            return declared
+        return len(self.binary_data)
 
     def to_frames(self) -> list[bytes]:
+        meta = dict(self.payload)
+        if self.binary_data:
+            meta["payload_bytes"] = len(self.binary_data)
+            meta["has_binary_frame"] = True
         body = {
             "worker_id": self.worker_id,
             "session_id": self.session_id,
@@ -50,9 +62,12 @@ class Message:
             "job_id": self.job_id,
             "timestamp": self.timestamp,
             "heartbeat_counter": self.heartbeat_counter,
-            "payload": self.payload,
+            "payload": meta,
         }
-        return [self.msg_type.value.encode("utf-8"), json.dumps(body).encode("utf-8")]
+        frames = [self.msg_type.value.encode("utf-8"), json.dumps(body).encode("utf-8")]
+        if self.binary_data:
+            frames.append(self.binary_data)
+        return frames
 
     @classmethod
     def from_frames(cls, frames: list[bytes]) -> Message:
@@ -60,6 +75,10 @@ class Message:
             raise ValueError(f"Message requires at least 2 frames, got {len(frames)}")
         msg_type = MsgType(frames[0].decode("utf-8"))
         body = json.loads(frames[1].decode("utf-8"))
+        payload = body.get("payload", {})
+        binary_data = frames[2] if len(frames) > 2 else b""
+        if binary_data and "payload_bytes" not in payload:
+            payload = {**payload, "payload_bytes": len(binary_data)}
         return cls(
             msg_type=msg_type,
             worker_id=body.get("worker_id", ""),
@@ -68,7 +87,8 @@ class Message:
             job_id=body.get("job_id", ""),
             timestamp=body.get("timestamp", time.time()),
             heartbeat_counter=body.get("heartbeat_counter", 0),
-            payload=body.get("payload", {}),
+            payload=payload,
+            binary_data=binary_data,
         )
 
 
@@ -88,6 +108,10 @@ def frame_summary(frame: bytes, max_len: int = 200) -> str:
 
 def summarize_frames(frames: list[bytes]) -> list[str]:
     return [frame_summary(f) for f in frames]
+
+
+def binary_payload_size(frames: list[bytes]) -> int:
+    return len(frames[2]) if len(frames) > 2 else 0
 
 
 def _correlation_suffix(
@@ -120,6 +144,7 @@ def log_transport_recv(
     worker_id: str = "",
     session_id: str = "",
     socket_generation: int = 0,
+    payload_bytes: int = 0,
 ) -> None:
     corr = _correlation_suffix(
         job_id=job_id,
@@ -128,13 +153,16 @@ def log_transport_recv(
         socket_generation=socket_generation,
         routing_id=routing_id,
     )
+    total_bytes = sum(len(f) for f in frames)
     log.info(
         "TRANSPORT_RECV component=%s mono_ts=%.6f wall_ts=%.6f "
-        "frame_count=%d frames=%s %s",
+        "frame_count=%d total_bytes=%d payload_bytes=%d frames=%s %s",
         component,
         time.monotonic(),
         time.time(),
         len(frames),
+        total_bytes,
+        payload_bytes,
         summarize_frames(frames),
         corr,
     )
@@ -154,6 +182,7 @@ def log_send_result(
     job_id: str = "",
     worker_id: str = "",
     routing_id: str | bytes | None = "",
+    payload_bytes: int = 0,
 ) -> None:
     corr = _correlation_suffix(
         job_id=job_id,
@@ -164,11 +193,12 @@ def log_send_result(
     )
     log.info(
         "SEND_RESULT component=%s msg_type=%s success=%s duration_ms=%.3f "
-        "error=%s errno=%s %s",
+        "payload_bytes=%d error=%s errno=%s %s",
         component,
         msg_type,
         success,
         duration_ms,
+        payload_bytes,
         error,
         errno,
         corr,

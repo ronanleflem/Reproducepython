@@ -34,6 +34,7 @@ from protocol import (
     WorkerState,
     log_send_result,
     log_transport_recv,
+    binary_payload_size,
 )
 from socket_monitor import SocketMonitor
 from timeline import TimelineCollector, TransportCase
@@ -193,6 +194,7 @@ class Broker:
             job_id=msg.job_id,
             worker_id=msg.worker_id,
             routing_id=routing_id,
+            payload_bytes=msg.payload_bytes,
         )
         if msg.msg_type == MsgType.RESULT_ACK and success:
             job = self._jobs.get(msg.job_id)
@@ -416,12 +418,13 @@ class Broker:
 
         log.info(
             "APP result_received routing_id=%s worker_id=%s session_id=%s "
-            "job_id=%s worker_known=%s worker_state=%s job_known=%s "
-            "job_completed=%s policy=%s",
+            "job_id=%s payload_bytes=%d worker_known=%s worker_state=%s "
+            "job_known=%s job_completed=%s policy=%s",
             routing_id.hex(),
             msg.worker_id,
             msg.session_id,
             msg.job_id,
+            msg.payload_bytes,
             worker is not None,
             worker.state.value if worker else "N/A",
             job is not None,
@@ -438,7 +441,10 @@ class Broker:
             socket_generation=msg.socket_generation,
             job_id=msg.job_id,
             routing_id=routing_id,
-            details={"routing_verify": rv.inconsistencies},
+            details={
+                "routing_verify": rv.inconsistencies,
+                "payload_bytes": msg.payload_bytes,
+            },
         )
 
         accepted = False
@@ -689,7 +695,11 @@ class Broker:
                         routing_id = raw[0]
                         payload_frames = raw[1:]
                         log_transport_recv(
-                            log, routing_id, payload_frames, "broker"
+                            log,
+                            routing_id,
+                            payload_frames,
+                            "broker",
+                            payload_bytes=binary_payload_size(payload_frames),
                         )
                         self._process_message(routing_id, payload_frames)
                 break
@@ -702,7 +712,13 @@ class Broker:
                 raw = self.socket.recv_multipart()
                 routing_id = raw[0]
                 payload_frames = raw[1:]
-                log_transport_recv(log, routing_id, payload_frames, "broker")
+                log_transport_recv(
+                    log,
+                    routing_id,
+                    payload_frames,
+                    "broker",
+                    payload_bytes=binary_payload_size(payload_frames),
+                )
                 self._process_message(routing_id, payload_frames)
 
             if auto_dispatch and not job_sent:
@@ -736,7 +752,13 @@ class Broker:
                 raw = self.socket.recv_multipart()
                 routing_id = raw[0]
                 payload_frames = raw[1:]
-                log_transport_recv(log, routing_id, payload_frames, "broker")
+                log_transport_recv(
+                    log,
+                    routing_id,
+                    payload_frames,
+                    "broker",
+                    payload_bytes=binary_payload_size(payload_frames),
+                )
                 self._process_message(routing_id, payload_frames)
             self._expire_stale_workers()
 

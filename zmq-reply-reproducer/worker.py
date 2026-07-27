@@ -23,6 +23,7 @@ from config import (
     zmq_options_from_args,
 )
 from logging_setup import setup_logging
+from payload_utils import make_result_payload
 from protocol import (
     Message,
     MsgType,
@@ -230,6 +231,7 @@ class WorkerSocket:
             errno=errno_val,
             job_id=msg.job_id,
             worker_id=msg.worker_id,
+            payload_bytes=msg.payload_bytes,
         )
         if msg.msg_type == MsgType.RESULT:
             event = "RESULT_SENT" if success else "RESULT_SEND_FAILED"
@@ -241,7 +243,11 @@ class WorkerSocket:
                     session_id=self.session_id,
                     socket_generation=self.socket_generation,
                     job_id=msg.job_id,
-                    details={"duration_ms": duration_ms, "error": error},
+                    details={
+                        "duration_ms": duration_ms,
+                        "error": error,
+                        "payload_bytes": msg.payload_bytes,
+                    },
                 )
         elif msg.msg_type == MsgType.READY and self.timeline:
             self.timeline.emit(
@@ -261,6 +267,7 @@ class WorkerSocket:
         if self.socket not in events:
             return None
         frames = self.socket.recv_multipart()
+        msg = Message.from_frames(frames)
         log_transport_recv(
             log,
             None,
@@ -269,8 +276,10 @@ class WorkerSocket:
             worker_id=self.config.worker_id,
             session_id=self.session_id,
             socket_generation=self.socket_generation,
+            job_id=msg.job_id,
+            payload_bytes=msg.payload_bytes,
         )
-        return Message.from_frames(frames)
+        return msg
 
     @property
     def reconnect_events(self) -> int:
@@ -443,6 +452,16 @@ class Worker:
         if self.config.reply_delay > 0:
             log.info("APP reply_delay sleeping %.3fs", self.config.reply_delay)
             time.sleep(self.config.reply_delay)
+        payload_bytes = self.config.result_payload_bytes
+        binary_data = b""
+        if payload_bytes > 0:
+            binary_data = make_result_payload(payload_bytes, self.config.payload_seed)
+            log.info(
+                "APP result_payload_prepared job_id=%s payload_bytes=%d seed=%d",
+                job_id,
+                payload_bytes,
+                self.config.payload_seed,
+            )
         result = Message(
             msg_type=MsgType.RESULT,
             worker_id=self.config.worker_id,
@@ -451,6 +470,7 @@ class Worker:
             job_id=job_id,
             timestamp=time.time(),
             payload={"strategy": self.config.strategy},
+            binary_data=binary_data,
         )
         ok = self.sock.send_message(result)
         self.stats.send_succeeded = ok
@@ -727,6 +747,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--reconnect-delay", type=float, default=0.0)
     parser.add_argument("--reply-delay", type=float, default=0.0)
     parser.add_argument("--network-delay", type=float, default=0.0)
+    parser.add_argument(
+        "--result-payload-bytes",
+        type=int,
+        default=0,
+        help="Taille du blob binaire RESULT (0 = message léger)",
+    )
+    parser.add_argument(
+        "--payload-seed",
+        type=int,
+        default=0,
+        help="Seed pour générer un payload binaire reproductible",
+    )
     parser.add_argument("--result-ack-timeout", type=float, default=2.0)
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--no-monitor", action="store_true")
@@ -750,6 +782,8 @@ def main() -> None:
         reconnect_delay=args.reconnect_delay,
         reply_delay=args.reply_delay,
         network_delay=args.network_delay,
+        result_payload_bytes=args.result_payload_bytes,
+        payload_seed=args.payload_seed,
         result_ack_timeout=args.result_ack_timeout,
         zmq_options=zmq_options_from_args(args),
         monitor_enabled=not args.no_monitor,

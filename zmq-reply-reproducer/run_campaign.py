@@ -23,6 +23,11 @@ from config import (
     ZmqSocketOptions,
 )
 from logging_setup import setup_logging
+from payload_utils import (
+    CAMPAIGN_AVG_PAYLOAD_BYTES,
+    jitter_payload_bytes,
+    payload_timeout_bonus,
+)
 from timeline import (
     RunOutcome,
     TimelineCollector,
@@ -121,6 +126,13 @@ def run_single_campaign_scenario(
     reconnect_delay = apply_jitter(rng, scenario.reconnect_delay, cfg.jitter)
     reply_delay = apply_jitter(rng, scenario.reply_delay, cfg.jitter)
     network_delay = apply_jitter(rng, scenario.network_delay, cfg.jitter)
+    result_payload_bytes = jitter_payload_bytes(
+        rng, cfg.avg_payload_bytes, cfg.payload_jitter
+    )
+    payload_seed = cfg.seed + run_index
+    scenario_timeout = cfg.scenario_timeout + payload_timeout_bonus(
+        result_payload_bytes
+    )
     log_level = "INFO" if cfg.verbose else "ERROR"
 
     timeline = TimelineCollector(run_id=run_id, enabled=cfg.timeline_enabled)
@@ -154,6 +166,8 @@ def run_single_campaign_scenario(
         reply_delay=reply_delay,
         network_delay=network_delay,
         result_ack_timeout=1.5,
+        result_payload_bytes=result_payload_bytes,
+        payload_seed=payload_seed,
         zmq_options=ZmqSocketOptions(
             immediate=scenario.zmq_immediate or cfg.zmq_immediate,
             linger=cfg.zmq_linger,
@@ -173,7 +187,7 @@ def run_single_campaign_scenario(
         try:
             stats = broker.run_once(
                 auto_dispatch=True,
-                timeout=cfg.scenario_timeout,
+                timeout=scenario_timeout,
             )
             broker_stats_holder.append(stats)
         except Exception as exc:
@@ -188,7 +202,7 @@ def run_single_campaign_scenario(
     worker = Worker(worker_cfg, timeline=timeline, run_id=run_id)
     worker_stats = worker.run()
 
-    bt.join(timeout=cfg.scenario_timeout + 3)
+    bt.join(timeout=scenario_timeout + 3)
     if broker_error:
         log.error("Broker error in run %s: %s", run_id, broker_error[0])
 
@@ -234,6 +248,8 @@ def run_single_campaign_scenario(
             "reconnect_delay": reconnect_delay,
             "reply_delay": reply_delay,
             "network_delay": network_delay,
+            "result_payload_bytes": result_payload_bytes,
+            "payload_seed": payload_seed,
             "heartbeat_interval": hb_interval,
             "worker_timeout": worker_timeout,
             "zmq_immediate": scenario.zmq_immediate,
@@ -280,7 +296,8 @@ def run_campaign(cfg: CampaignConfig) -> list[RunOutcome]:
     print(
         f"Campagne: {cfg.runs} scénarios (seed={cfg.seed}, "
         f"heartbeat={heartbeat_interval}s, timeout={worker_timeout}s, "
-        f"job_base={base_job_duration}s, jitter={cfg.jitter})"
+        f"job_base={base_job_duration}s, jitter={cfg.jitter}, "
+        f"payload_avg={cfg.avg_payload_bytes}B±{cfg.payload_jitter:.0%})"
     )
 
     outcomes: list[RunOutcome] = []
@@ -308,6 +325,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--runs", type=int, default=300)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--jitter", type=float, default=0.15)
+    parser.add_argument(
+        "--avg-payload-bytes",
+        type=int,
+        default=CAMPAIGN_AVG_PAYLOAD_BYTES,
+        help="Taille moyenne du payload RESULT (~20 Mo par défaut)",
+    )
+    parser.add_argument(
+        "--payload-jitter",
+        type=float,
+        default=0.15,
+        help="Jitter relatif sur la taille du payload",
+    )
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--result-policy", choices=["strict", "job-id"], default="strict")
     parser.add_argument(
@@ -340,6 +369,8 @@ def main() -> None:
         threading_mode=args.threading_mode,
         scenario_timeout=args.scenario_timeout,
         zmq_immediate=args.zmq_immediate,
+        avg_payload_bytes=args.avg_payload_bytes,
+        payload_jitter=args.payload_jitter,
         monitor_enabled=not args.no_monitor,
         timeline_enabled=not args.no_timeline,
         report_path=args.report,
