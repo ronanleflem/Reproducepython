@@ -21,6 +21,12 @@ from config import (
     env_log_level,
     zmq_options_from_args,
 )
+from investigation import (
+    log_routing_verification,
+    log_state_transition,
+    log_transport_case,
+    verify_routing,
+)
 from logging_setup import setup_logging
 from protocol import (
     Message,
@@ -30,6 +36,7 @@ from protocol import (
     log_transport_recv,
 )
 from socket_monitor import SocketMonitor
+from timeline import TimelineCollector, TransportCase
 
 log = setup_logging("broker", env_log_level())
 
@@ -57,6 +64,7 @@ class JobRecord:
     result_accepted: bool = False
     result_rejected: bool = False
     reject_reason: str | None = None
+    result_ack_sent: bool = False
 
 
 @dataclass
@@ -66,15 +74,28 @@ class BrokerStats:
     result_accepted: bool = False
     result_rejected: bool = False
     result_missing: bool = True
+    result_ack_sent: bool = False
+    transport_case: TransportCase = TransportCase.INCONCLUSIVE
+    reject_reason: str | None = None
+    job_id: str = ""
+    routing_id_changes: int = 0
+    session_changes: int = 0
+    reconnect_events: int = 0
 
 
 class Broker:
-    def __init__(self, config: BrokerConfig) -> None:
+    def __init__(
+        self,
+        config: BrokerConfig,
+        timeline: TimelineCollector | None = None,
+        run_id: str = "",
+    ) -> None:
         self.config = config
         self.ctx = zmq.Context.instance()
         self.socket = self.ctx.socket(zmq.ROUTER)
         self._heartbeat_counter = 0
         self._workers: dict[bytes, WorkerRecord] = {}
+        self._workers_by_id: dict[str, WorkerRecord] = {}
         self._jobs: dict[str, JobRecord] = {}
         self._expired_workers: list[WorkerRecord] = []
         self._stop = threading.Event()
@@ -83,6 +104,34 @@ class Broker:
         self.stats = BrokerStats()
         self._job_dispatched = threading.Event()
         self._result_handled = threading.Event()
+        self.timeline = timeline or TimelineCollector(run_id=run_id, enabled=True)
+        self._current_job_id = ""
+        self._routing_id_changes = 0
+        self._session_changes = 0
+
+    def _transition(
+        self,
+        worker: WorkerRecord,
+        to_state: WorkerState,
+        reason: str,
+    ) -> None:
+        from_state = worker.state
+        if from_state == to_state:
+            return
+        worker.state = to_state
+        log_state_transition(
+            log,
+            self.timeline,
+            component="broker",
+            worker_id=worker.worker_id,
+            session_id=worker.session_id,
+            socket_generation=worker.socket_generation,
+            job_id=worker.current_job_id or "",
+            routing_id=worker.routing_id,
+            from_state=from_state,
+            to_state=to_state,
+            reason=reason,
+        )
 
     def _log_effective_options(self) -> None:
         s = self.socket
@@ -100,8 +149,13 @@ class Broker:
         opts = self.config.zmq_options
         opts.apply(self.socket)
         if self.config.monitor_enabled:
+            monitor_ep = f"{DEFAULT_MONITOR_ENDPOINT}-broker-{id(self)}"
             self._monitor = SocketMonitor(
-                "broker", f"{DEFAULT_MONITOR_ENDPOINT}-broker", log
+                "broker",
+                monitor_ep,
+                log,
+                timeline=self.timeline,
+                generation_getter=lambda: 0,
             )
             self._monitor.attach(self.socket)
         self.socket.bind(self.config.endpoint)
@@ -136,7 +190,24 @@ class Broker:
             session_id=msg.session_id,
             error=error,
             errno=errno_val,
+            job_id=msg.job_id,
+            worker_id=msg.worker_id,
+            routing_id=routing_id,
         )
+        if msg.msg_type == MsgType.RESULT_ACK and success:
+            job = self._jobs.get(msg.job_id)
+            if job:
+                job.result_ack_sent = True
+            self.stats.result_ack_sent = True
+            self.timeline.emit(
+                "RESULT_ACK_SENT",
+                component="broker",
+                worker_id=msg.worker_id,
+                session_id=msg.session_id,
+                socket_generation=msg.socket_generation,
+                job_id=msg.job_id,
+                routing_id=routing_id,
+            )
         return success
 
     def _expire_stale_workers(self) -> None:
@@ -158,29 +229,86 @@ class Broker:
                     timeout,
                     worker.current_job_id,
                 )
-                worker.state = WorkerState.EXPIRED
+                self.timeline.emit(
+                    "WORKER_EXPIRED",
+                    component="broker",
+                    worker_id=worker.worker_id,
+                    session_id=worker.session_id,
+                    socket_generation=worker.socket_generation,
+                    job_id=worker.current_job_id or "",
+                    routing_id=routing_id,
+                    details={"age": age, "timeout": timeout},
+                )
+                self._transition(worker, WorkerState.EXPIRED, "liveness_timeout")
                 worker.expired_at = now
                 self.stats.worker_expired = True
                 self._expired_workers.append(worker)
+                self._transition(worker, WorkerState.REMOVED, "removed_from_registry")
                 del self._workers[routing_id]
+                if self._workers_by_id.get(worker.worker_id) is worker:
+                    del self._workers_by_id[worker.worker_id]
 
     def _handle_ready(self, routing_id: bytes, msg: Message) -> None:
+        existing = self._workers_by_id.get(msg.worker_id)
+        is_reconnect = False
+        if existing and existing.routing_id != routing_id:
+            is_reconnect = True
+            self._routing_id_changes += 1
+            self.timeline.emit(
+                "ROUTING_ID_CHANGED",
+                component="broker",
+                worker_id=msg.worker_id,
+                session_id=msg.session_id,
+                socket_generation=msg.socket_generation,
+                routing_id=routing_id,
+                details={
+                    "old_routing_id": existing.routing_id.hex(),
+                    "new_routing_id": routing_id.hex(),
+                },
+            )
+        if existing and existing.session_id != msg.session_id:
+            self._session_changes += 1
+            self.timeline.emit(
+                "SESSION_CHANGED",
+                component="broker",
+                worker_id=msg.worker_id,
+                session_id=msg.session_id,
+                socket_generation=msg.socket_generation,
+                routing_id=routing_id,
+                details={"old_session_id": existing.session_id},
+            )
+
         worker = WorkerRecord(
             routing_id=routing_id,
             worker_id=msg.worker_id,
             session_id=msg.session_id,
             socket_generation=msg.socket_generation,
-            state=WorkerState.READY,
+            state=WorkerState.RECONNECTED if is_reconnect else WorkerState.READY,
             last_heartbeat=time.monotonic(),
         )
         self._workers[routing_id] = worker
+        self._workers_by_id[msg.worker_id] = worker
+
+        if is_reconnect:
+            self._transition(worker, WorkerState.READY, "ready_after_reconnect")
+        else:
+            self.timeline.emit(
+                "READY_RECEIVED",
+                component="broker",
+                worker_id=msg.worker_id,
+                session_id=msg.session_id,
+                socket_generation=msg.socket_generation,
+                routing_id=routing_id,
+            )
+
         log.info(
             "APP ready_accepted worker_id=%s session_id=%s routing_id=%s "
-            "socket_generation=%d",
+            "socket_generation=%d reconnect=%s",
             msg.worker_id,
             msg.session_id,
             routing_id.hex(),
             msg.socket_generation,
+            is_reconnect,
         )
         ack = Message(
             msg_type=MsgType.READY_ACK,
@@ -190,10 +318,20 @@ class Broker:
             timestamp=time.time(),
         )
         self._send_to_worker(routing_id, ack)
+        self.timeline.emit(
+            "READY_ACK_SENT",
+            component="broker",
+            worker_id=msg.worker_id,
+            session_id=msg.session_id,
+            socket_generation=msg.socket_generation,
+            routing_id=routing_id,
+        )
 
     def _dispatch_job(self, routing_id: bytes, worker: WorkerRecord) -> None:
         job_id = str(uuid.uuid4())
-        worker.state = WorkerState.BUSY
+        self._current_job_id = job_id
+        self.stats.job_id = job_id
+        self._transition(worker, WorkerState.BUSY, "job_dispatched")
         worker.current_job_id = job_id
         self._jobs[job_id] = JobRecord(
             job_id=job_id,
@@ -218,6 +356,15 @@ class Broker:
             worker.session_id,
             routing_id.hex(),
         )
+        self.timeline.emit(
+            "JOB_SENT",
+            component="broker",
+            worker_id=worker.worker_id,
+            session_id=worker.session_id,
+            socket_generation=worker.socket_generation,
+            job_id=job_id,
+            routing_id=routing_id,
+        )
         self._send_to_worker(routing_id, job_msg)
         self._job_dispatched.set()
 
@@ -232,6 +379,16 @@ class Broker:
                 msg.session_id,
                 msg.heartbeat_counter,
             )
+            self.timeline.emit(
+                "HEARTBEAT_RECEIVED",
+                component="broker",
+                worker_id=msg.worker_id,
+                session_id=msg.session_id,
+                socket_generation=msg.socket_generation,
+                job_id=worker.current_job_id or "",
+                routing_id=routing_id,
+                details={"heartbeat_counter": msg.heartbeat_counter},
+            )
         else:
             log.info(
                 "APP heartbeat_from_unknown_worker routing_id=%s worker_id=%s "
@@ -245,6 +402,17 @@ class Broker:
     def _handle_result(self, routing_id: bytes, msg: Message) -> None:
         worker = self._workers.get(routing_id)
         job = self._jobs.get(msg.job_id) if msg.job_id else None
+
+        rv = verify_routing(
+            routing_id,
+            msg.worker_id,
+            msg.session_id,
+            msg.job_id,
+            self._workers,
+            self._jobs,
+            self._workers_by_id,
+        )
+        log_routing_verification(log, rv, MsgType.RESULT.value)
 
         log.info(
             "APP result_received routing_id=%s worker_id=%s session_id=%s "
@@ -262,6 +430,17 @@ class Broker:
         )
 
         self.stats.raw_message_received = True
+        self.timeline.emit(
+            "RESULT_RECEIVED",
+            component="broker",
+            worker_id=msg.worker_id,
+            session_id=msg.session_id,
+            socket_generation=msg.socket_generation,
+            job_id=msg.job_id,
+            routing_id=routing_id,
+            details={"routing_verify": rv.inconsistencies},
+        )
+
         accepted = False
         reject_reason: str | None = None
 
@@ -293,11 +472,12 @@ class Broker:
         if accepted:
             self.stats.result_accepted = True
             self.stats.result_missing = False
+            self.stats.reject_reason = None
             if job:
                 job.completed = True
                 job.result_accepted = True
             if worker:
-                worker.state = WorkerState.READY
+                self._transition(worker, WorkerState.READY, "result_accepted")
                 worker.current_job_id = None
             ack = Message(
                 msg_type=MsgType.RESULT_ACK,
@@ -308,6 +488,15 @@ class Broker:
                 timestamp=time.time(),
             )
             self._send_to_worker(routing_id, ack)
+            self.timeline.emit(
+                "RESULT_ACCEPTED",
+                component="broker",
+                worker_id=msg.worker_id,
+                session_id=msg.session_id,
+                socket_generation=msg.socket_generation,
+                job_id=msg.job_id,
+                routing_id=routing_id,
+            )
             log.info(
                 "APP result_accepted job_id=%s worker_id=%s session_id=%s",
                 msg.job_id,
@@ -317,9 +506,20 @@ class Broker:
         else:
             self.stats.result_rejected = True
             self.stats.result_missing = False
+            self.stats.reject_reason = reject_reason
             if job:
                 job.result_rejected = True
                 job.reject_reason = reject_reason
+            self.timeline.emit(
+                "RESULT_REJECTED",
+                component="broker",
+                worker_id=msg.worker_id,
+                session_id=msg.session_id,
+                socket_generation=msg.socket_generation,
+                job_id=msg.job_id,
+                routing_id=routing_id,
+                details={"reason": reject_reason},
+            )
             log.warning(
                 "APP result_rejected job_id=%s worker_id=%s session_id=%s "
                 "reason=%s routing_id=%s",
@@ -328,6 +528,16 @@ class Broker:
                 msg.session_id,
                 reject_reason,
                 routing_id.hex(),
+            )
+            log_transport_case(
+                log,
+                TransportCase.CASE2_RECV_REJECTED.value,
+                job_id=msg.job_id,
+                worker_id=msg.worker_id,
+                session_id=msg.session_id,
+                socket_generation=msg.socket_generation,
+                routing_id=routing_id.hex(),
+                details={"reject_reason": reject_reason},
             )
 
         self._result_handled.set()
@@ -343,6 +553,17 @@ class Broker:
                 exc,
             )
             return
+
+        rv = verify_routing(
+            routing_id,
+            msg.worker_id,
+            msg.session_id,
+            msg.job_id,
+            self._workers,
+            self._jobs,
+            self._workers_by_id,
+        )
+        log_routing_verification(log, rv, msg.msg_type.value)
 
         log.info(
             "APP message_parsed type=%s worker_id=%s session_id=%s job_id=%s "
@@ -383,9 +604,62 @@ class Broker:
                     timestamp=now,
                 )
                 self._send_to_worker(routing_id, hb)
+                self.timeline.emit(
+                    "HEARTBEAT_SENT",
+                    component="broker",
+                    worker_id=worker.worker_id,
+                    session_id=worker.session_id,
+                    socket_generation=worker.socket_generation,
+                    job_id=worker.current_job_id or "",
+                    routing_id=routing_id,
+                    details={"heartbeat_counter": self._heartbeat_counter},
+                )
             self._stop.wait(self.config.heartbeat_interval)
 
-    def run_once(self, auto_dispatch: bool = True, timeout: float = 60.0) -> BrokerStats:
+    def _finalize_transport_case(self, worker_send_ok: bool = False) -> None:
+        if not worker_send_ok and not self.stats.raw_message_received:
+            self.stats.result_missing = True
+            self.stats.transport_case = TransportCase.INCONCLUSIVE
+            return
+        if worker_send_ok and not self.stats.raw_message_received:
+            self.stats.transport_case = TransportCase.CASE1_SEND_NO_RECV
+            log_transport_case(
+                log,
+                TransportCase.CASE1_SEND_NO_RECV.value,
+                job_id=self._current_job_id,
+                worker_id="",
+                session_id="",
+                socket_generation=0,
+            )
+        elif self.stats.result_rejected:
+            self.stats.transport_case = TransportCase.CASE2_RECV_REJECTED
+        elif self.stats.result_accepted and not self.stats.result_ack_sent:
+            self.stats.transport_case = TransportCase.CASE3_ACCEPTED_ACK_LOST
+            log_transport_case(
+                log,
+                TransportCase.CASE3_ACCEPTED_ACK_LOST.value,
+                job_id=self._current_job_id,
+                worker_id="",
+                session_id="",
+                socket_generation=0,
+            )
+        elif self.stats.result_accepted:
+            self.stats.transport_case = TransportCase.SUCCESS
+        elif not self.stats.raw_message_received:
+            self.stats.result_missing = True
+            self.stats.transport_case = TransportCase.INCONCLUSIVE
+
+        self.stats.routing_id_changes = self._routing_id_changes
+        self.stats.session_changes = self._session_changes
+        if self._monitor:
+            self.stats.reconnect_events = self._monitor.reconnect_event_count
+
+    def run_once(
+        self,
+        auto_dispatch: bool = True,
+        timeout: float = 60.0,
+        worker_send_ok: bool = False,
+    ) -> BrokerStats:
         """Exécute un cycle broker : READY -> JOB -> attendre RESULT."""
         global log
         log = setup_logging("broker", self.config.log_level)
@@ -397,14 +671,13 @@ class Broker:
 
         deadline = time.monotonic() + timeout
         job_sent = False
-        post_result_grace = 1.0  # laisser le worker recevoir un éventuel RESULT_ACK
+        post_result_grace = 1.0
 
         poller = zmq.Poller()
         poller.register(self.socket, zmq.POLLIN)
 
         while time.monotonic() < deadline:
             if self._result_handled.is_set():
-                # Grace period pour RESULT_ACK sortant
                 grace_deadline = time.monotonic() + post_result_grace
                 while time.monotonic() < grace_deadline:
                     remaining = int((grace_deadline - time.monotonic()) * 1000)
@@ -415,7 +688,9 @@ class Broker:
                         raw = self.socket.recv_multipart()
                         routing_id = raw[0]
                         payload_frames = raw[1:]
-                        log_transport_recv(log, routing_id, payload_frames, "broker")
+                        log_transport_recv(
+                            log, routing_id, payload_frames, "broker"
+                        )
                         self._process_message(routing_id, payload_frames)
                 break
 
@@ -432,7 +707,8 @@ class Broker:
 
             if auto_dispatch and not job_sent:
                 for routing_id, worker in list(self._workers.items()):
-                    if worker.state == WorkerState.READY:
+                    if worker.state in (WorkerState.READY, WorkerState.RECONNECTED):
+                        self._transition(worker, WorkerState.READY, "pre_dispatch")
                         self._dispatch_job(routing_id, worker)
                         job_sent = True
                         break
@@ -442,6 +718,7 @@ class Broker:
         if not self.stats.raw_message_received:
             self.stats.result_missing = True
 
+        self._finalize_transport_case(worker_send_ok=worker_send_ok)
         return self.stats
 
     def run_forever(self) -> None:

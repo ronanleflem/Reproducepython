@@ -7,7 +7,7 @@ import argparse
 import queue
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any
 
 import zmq
@@ -31,6 +31,7 @@ from protocol import (
     new_session_id,
 )
 from socket_monitor import SocketMonitor
+from timeline import SessionValidationMode, TimelineCollector, TransportCase
 
 log = setup_logging("worker", env_log_level())
 
@@ -40,6 +41,13 @@ class WorkerStats:
     send_succeeded: bool = False
     result_ack_received: bool = False
     worker_was_ready: bool = False
+    session_validated_heartbeat: bool = False
+    session_validated_ready_ack: bool = False
+    session_validated_result_ack: bool = False
+    reconnect_events: int = 0
+    manual_reconnect_performed: bool = False
+    transport_case: TransportCase = TransportCase.INCONCLUSIVE
+    job_id: str = ""
 
 
 @dataclass
@@ -52,22 +60,37 @@ class JobRequest:
 class WorkerSocket:
     """Encapsule la socket DEALER avec reconnect léger/complet."""
 
-    def __init__(self, config: WorkerConfig) -> None:
+    def __init__(
+        self,
+        config: WorkerConfig,
+        timeline: TimelineCollector | None = None,
+    ) -> None:
         self.config = config
+        self.timeline = timeline
         self.ctx = zmq.Context.instance()
         self.socket: zmq.Socket | None = None
         self.session_id = new_session_id()
         self.socket_generation = 0
         self._monitor: SocketMonitor | None = None
         self._identity = config.worker_id.encode("utf-8")
+        self.manual_reconnect_count = 0
+        self.auto_reconnect_detected = False
 
     def _create_socket(self) -> zmq.Socket:
         sock = self.ctx.socket(zmq.DEALER)
         opts = self.config.zmq_options
         opts.apply(sock, identity=self.config.worker_id)
         if self.config.monitor_enabled:
-            monitor_ep = f"{DEFAULT_MONITOR_ENDPOINT}-{self.config.worker_id}"
-            self._monitor = SocketMonitor("worker", monitor_ep, log)
+            monitor_ep = f"{DEFAULT_MONITOR_ENDPOINT}-{self.config.worker_id}-{id(self)}"
+            self._monitor = SocketMonitor(
+                "worker",
+                monitor_ep,
+                log,
+                timeline=self.timeline,
+                generation_getter=lambda: self.socket_generation,
+                worker_id=self.config.worker_id,
+                session_id_getter=lambda: self.session_id,
+            )
             self._monitor.attach(sock)
         return sock
 
@@ -100,21 +123,40 @@ class WorkerSocket:
             self.session_id,
             self.config.broker_endpoint,
         )
+        if self.timeline:
+            self.timeline.emit(
+                "SOCKET_CONNECTED",
+                component="worker",
+                worker_id=self.config.worker_id,
+                session_id=self.session_id,
+                socket_generation=self.socket_generation,
+            )
 
     def reconnect_light(self) -> None:
         """disconnect/connect sur la même socket."""
         assert self.socket is not None
+        self.manual_reconnect_count += 1
         log.info(
             "Reconnect LIGHT generation=%d session_id=%s (session unchanged)",
             self.socket_generation,
             self.session_id,
         )
+        if self.timeline:
+            self.timeline.emit(
+                "MANUAL_RECONNECT_LIGHT",
+                component="worker",
+                worker_id=self.config.worker_id,
+                session_id=self.session_id,
+                socket_generation=self.socket_generation,
+                details={"attempt": self.manual_reconnect_count},
+            )
         self.socket.disconnect(self.config.broker_endpoint)
         self.socket.connect(self.config.broker_endpoint)
 
     def reconnect_full(self) -> None:
         """Fermeture complète et nouvelle socket avec nouveau session_id."""
         old_gen = self.socket_generation
+        old_session = self.session_id
         if self._monitor:
             self._monitor.stop()
             self._monitor = None
@@ -123,6 +165,7 @@ class WorkerSocket:
             self.socket = None
         self.socket_generation += 1
         self.session_id = new_session_id()
+        self.manual_reconnect_count += 1
         self.socket = self._create_socket()
         self.socket.connect(self.config.broker_endpoint)
         self._log_effective_options()
@@ -135,6 +178,19 @@ class WorkerSocket:
             self.socket_generation,
             self.session_id,
         )
+        if self.timeline:
+            self.timeline.emit(
+                "MANUAL_RECONNECT_FULL",
+                component="worker",
+                worker_id=self.config.worker_id,
+                session_id=self.session_id,
+                socket_generation=self.socket_generation,
+                details={
+                    "old_generation": old_gen,
+                    "old_session_id": old_session,
+                    "attempt": self.manual_reconnect_count,
+                },
+            )
 
     def reconnect_socket(self) -> None:
         if self.config.reconnect_mode == "light":
@@ -172,7 +228,29 @@ class WorkerSocket:
             session_id=self.session_id,
             error=error,
             errno=errno_val,
+            job_id=msg.job_id,
+            worker_id=msg.worker_id,
         )
+        if msg.msg_type == MsgType.RESULT:
+            event = "RESULT_SENT" if success else "RESULT_SEND_FAILED"
+            if self.timeline:
+                self.timeline.emit(
+                    event,
+                    component="worker",
+                    worker_id=msg.worker_id,
+                    session_id=self.session_id,
+                    socket_generation=self.socket_generation,
+                    job_id=msg.job_id,
+                    details={"duration_ms": duration_ms, "error": error},
+                )
+        elif msg.msg_type == MsgType.READY and self.timeline:
+            self.timeline.emit(
+                "READY_SENT",
+                component="worker",
+                worker_id=msg.worker_id,
+                session_id=self.session_id,
+                socket_generation=self.socket_generation,
+            )
         return success
 
     def recv_message(self, timeout_ms: int = 5000) -> Message | None:
@@ -183,8 +261,20 @@ class WorkerSocket:
         if self.socket not in events:
             return None
         frames = self.socket.recv_multipart()
-        log_transport_recv(log, None, frames, "worker")
+        log_transport_recv(
+            log,
+            None,
+            frames,
+            "worker",
+            worker_id=self.config.worker_id,
+            session_id=self.session_id,
+            socket_generation=self.socket_generation,
+        )
         return Message.from_frames(frames)
+
+    @property
+    def reconnect_events(self) -> int:
+        return self._monitor.reconnect_event_count if self._monitor else 0
 
     def shutdown(self) -> None:
         if self._monitor:
@@ -195,9 +285,15 @@ class WorkerSocket:
 
 
 class Worker:
-    def __init__(self, config: WorkerConfig) -> None:
+    def __init__(
+        self,
+        config: WorkerConfig,
+        timeline: TimelineCollector | None = None,
+        run_id: str = "",
+    ) -> None:
         self.config = config
-        self.sock = WorkerSocket(config)
+        self.timeline = timeline or TimelineCollector(run_id=run_id, enabled=True)
+        self.sock = WorkerSocket(config, timeline=self.timeline)
         self.stats = WorkerStats()
         self._current_session_id = ""
         self._job_queue: queue.Queue[JobRequest | None] = queue.Queue()
@@ -207,6 +303,7 @@ class Worker:
         self._job_thread: threading.Thread | None = None
         self._pending_job: JobRequest | None = None
         self._last_heartbeat_session: str | None = None
+        self._current_job_id = ""
 
     def _classify_heartbeat_session(self, msg: Message) -> str:
         if msg.session_id == self.sock.session_id:
@@ -215,7 +312,7 @@ class Worker:
             return "old_session"
         return "unknown_session"
 
-    def _handle_heartbeat(self, msg: Message) -> None:
+    def _handle_heartbeat(self, msg: Message, job_id: str = "") -> None:
         classification = self._classify_heartbeat_session(msg)
         log.info(
             "APP heartbeat_received counter=%d session_id=%s "
@@ -227,6 +324,22 @@ class Worker:
             self.sock.socket_generation,
         )
         self._last_heartbeat_session = msg.session_id
+        if self.timeline:
+            self.timeline.emit(
+                "HEARTBEAT_RECEIVED",
+                component="worker",
+                worker_id=self.config.worker_id,
+                session_id=msg.session_id,
+                socket_generation=self.sock.socket_generation,
+                job_id=job_id or self._current_job_id,
+                details={
+                    "classification": classification,
+                    "heartbeat_counter": msg.heartbeat_counter,
+                    "reliable_session_indicator": classification == "current_session",
+                },
+            )
+        if classification == "current_session":
+            self.stats.session_validated_heartbeat = True
 
     def _send_ready_and_wait_ack(self, timeout: float = 3.0) -> bool:
         ready = Message(
@@ -252,6 +365,15 @@ class Worker:
                     )
                     self._current_session_id = msg.session_id
                     self.stats.worker_was_ready = True
+                    self.stats.session_validated_ready_ack = True
+                    if self.timeline:
+                        self.timeline.emit(
+                            "READY_ACK_RECEIVED",
+                            component="worker",
+                            worker_id=self.config.worker_id,
+                            session_id=msg.session_id,
+                            socket_generation=self.sock.socket_generation,
+                        )
                     return True
                 log.warning(
                     "APP ready_ack_wrong_session expected=%s got=%s",
@@ -271,11 +393,20 @@ class Worker:
             if msg is None:
                 continue
             if msg.msg_type == MsgType.HEARTBEAT:
-                self._handle_heartbeat(msg)
+                self._handle_heartbeat(msg, job_id=self._current_job_id)
                 if expected_session and msg.session_id == expected_session:
                     return True
                 if expected_session is None:
                     return True
+        if self.timeline:
+            self.timeline.emit(
+                "HEARTBEAT_WAIT_TIMEOUT",
+                component="worker",
+                worker_id=self.config.worker_id,
+                session_id=self.sock.session_id,
+                socket_generation=self.sock.socket_generation,
+                job_id=self._current_job_id,
+            )
         return False
 
     def _execute_job_blocking(self, job_id: str) -> None:
@@ -285,8 +416,28 @@ class Worker:
             self.config.job_duration,
             self.config.threading_mode,
         )
+        if self.timeline:
+            self.timeline.emit(
+                "JOB_PROCESSING_STARTED",
+                component="worker",
+                worker_id=self.config.worker_id,
+                session_id=self.sock.session_id,
+                socket_generation=self.sock.socket_generation,
+                job_id=job_id,
+            )
+        if self.config.network_delay > 0:
+            time.sleep(self.config.network_delay)
         time.sleep(self.config.job_duration)
         log.info("APP job_finished job_id=%s", job_id)
+        if self.timeline:
+            self.timeline.emit(
+                "JOB_PROCESSING_FINISHED",
+                component="worker",
+                worker_id=self.config.worker_id,
+                session_id=self.sock.session_id,
+                socket_generation=self.sock.socket_generation,
+                job_id=job_id,
+            )
 
     def _send_result(self, job_id: str) -> bool:
         if self.config.reply_delay > 0:
@@ -313,6 +464,16 @@ class Worker:
             self.config.reconnect_mode,
             job_id,
         )
+        if self.timeline:
+            self.timeline.emit(
+                "POST_JOB_STRATEGY_START",
+                component="worker",
+                worker_id=self.config.worker_id,
+                session_id=self.sock.session_id,
+                socket_generation=self.sock.socket_generation,
+                job_id=job_id,
+                details={"strategy": strategy, "reconnect_mode": self.config.reconnect_mode},
+            )
 
         if strategy == "no-reconnect":
             return self._send_result(job_id)
@@ -320,14 +481,26 @@ class Worker:
         if strategy == "auto-reconnect-only":
             if self.config.reconnect_delay > 0:
                 time.sleep(self.config.reconnect_delay)
+            if self.timeline:
+                self.timeline.emit(
+                    "AUTO_RECONNECT_ONLY",
+                    component="worker",
+                    worker_id=self.config.worker_id,
+                    session_id=self.sock.session_id,
+                    socket_generation=self.sock.socket_generation,
+                    job_id=job_id,
+                    details={"manual_reconnect": False},
+                )
             return self._send_result(job_id)
 
         if strategy == "manual-reconnect-immediate":
             self.sock.reconnect_socket()
+            self.stats.manual_reconnect_performed = True
             return self._send_result(job_id)
 
         if strategy == "manual-reconnect-heartbeat":
             self.sock.reconnect_socket()
+            self.stats.manual_reconnect_performed = True
             if not self._wait_for_heartbeat(
                 expected_session=self.sock.session_id, timeout=3.0
             ):
@@ -336,12 +509,14 @@ class Worker:
 
         if strategy == "manual-reconnect-ready-ack":
             self.sock.reconnect_full()
+            self.stats.manual_reconnect_performed = True
             if not self._send_ready_and_wait_ack():
                 log.warning("APP ready_ack_timeout after reconnect")
             return self._send_result(job_id)
 
         if strategy == "reconnect-then-delay":
             self.sock.reconnect_socket()
+            self.stats.manual_reconnect_performed = True
             if self.config.reconnect_delay > 0:
                 time.sleep(self.config.reconnect_delay)
             return self._send_result(job_id)
@@ -356,12 +531,31 @@ class Worker:
             if msg is None:
                 continue
             if msg.msg_type == MsgType.HEARTBEAT:
-                self._handle_heartbeat(msg)
+                self._handle_heartbeat(msg, job_id=job_id)
                 continue
             if msg.msg_type == MsgType.RESULT_ACK and msg.job_id == job_id:
                 log.info("APP result_ack_received job_id=%s", job_id)
                 self.stats.result_ack_received = True
+                self.stats.session_validated_result_ack = True
+                if self.timeline:
+                    self.timeline.emit(
+                        "RESULT_ACK_RECEIVED",
+                        component="worker",
+                        worker_id=self.config.worker_id,
+                        session_id=msg.session_id,
+                        socket_generation=self.sock.socket_generation,
+                        job_id=job_id,
+                    )
                 return True
+        if self.timeline:
+            self.timeline.emit(
+                "RESULT_ACK_TIMEOUT",
+                component="worker",
+                worker_id=self.config.worker_id,
+                session_id=self.sock.session_id,
+                socket_generation=self.sock.socket_generation,
+                job_id=job_id,
+            )
         return False
 
     def _run_blocking_network_loop(self) -> WorkerStats:
@@ -376,100 +570,26 @@ class Worker:
             return self.stats
 
         job_id = msg.job_id
+        self._current_job_id = job_id
+        self.stats.job_id = job_id
         log.info("APP job_received job_id=%s session_id=%s", job_id, msg.session_id)
+        if self.timeline:
+            self.timeline.emit(
+                "JOB_RECEIVED",
+                component="worker",
+                worker_id=self.config.worker_id,
+                session_id=msg.session_id,
+                socket_generation=msg.socket_generation,
+                job_id=job_id,
+            )
 
         self._execute_job_blocking(job_id)
         self._apply_post_job_strategy(job_id)
         self._wait_result_ack(job_id, timeout=self.config.result_ack_timeout)
-        return self.stats
-
-    def _network_loop_separate(self) -> None:
-        """Thread réseau unique : seule thread touchant la socket ZMQ."""
-        self.sock.connect()
-        if not self._send_ready_and_wait_ack():
-            log.error("APP initial_ready_ack_failed")
-            self._stop.set()
-            return
-
-        poller = zmq.Poller()
-        assert self.sock.socket is not None
-        poller.register(self.sock.socket, zmq.POLLIN)
-
-        while not self._stop.is_set():
-            # Envoyer résultats en attente
-            try:
-                job_id, _ = self._result_queue.get_nowait()
-                self._send_result(job_id)
-            except queue.Empty:
-                pass
-
-            events = dict(poller.poll(200))
-            if self.sock.socket not in events:
-                continue
-
-            msg = self.sock.recv_message(timeout_ms=0)
-            if msg is None:
-                continue
-
-            if msg.msg_type == MsgType.JOB:
-                log.info("APP job_received job_id=%s", msg.job_id)
-                self._job_queue.put(
-                    JobRequest(
-                        job_id=msg.job_id,
-                        session_id=msg.session_id,
-                        socket_generation=msg.socket_generation,
-                    )
-                )
-            elif msg.msg_type == MsgType.HEARTBEAT:
-                self._handle_heartbeat(msg)
-            elif msg.msg_type == MsgType.RESULT_ACK:
-                log.info("APP result_ack_received job_id=%s", msg.job_id)
-                self.stats.result_ack_received = True
-            elif msg.msg_type == MsgType.READY_ACK:
-                if msg.session_id == self.sock.session_id:
-                    self.stats.worker_was_ready = True
-
-    def _job_loop_separate(self) -> None:
-        """Thread job : sleep bloquant, ne touche jamais la socket."""
-        job = self._job_queue.get()
-        if job is None:
-            return
-        self._execute_job_blocking(job.job_id)
-
-        strategy = self.config.strategy
-        if strategy in ("no-reconnect", "auto-reconnect-only"):
-            self._result_queue.put((job.job_id, strategy))
-        elif strategy == "manual-reconnect-immediate":
-            # Reconnect must happen on network thread - signal via queue
-            self._result_queue.put((job.job_id, "manual-reconnect-immediate"))
-        elif strategy == "manual-reconnect-heartbeat":
-            self._result_queue.put((job.job_id, "manual-reconnect-heartbeat"))
-        elif strategy == "manual-reconnect-ready-ack":
-            self._result_queue.put((job.job_id, "manual-reconnect-ready-ack"))
-        elif strategy == "reconnect-then-delay":
-            self._result_queue.put((job.job_id, "reconnect-then-delay"))
-        else:
-            self._result_queue.put((job.job_id, strategy))
-
-    def _run_separate_job_thread(self) -> WorkerStats:
-        self._network_thread = threading.Thread(
-            target=self._network_loop_separate_with_strategy,
-            name="worker-network",
-            daemon=True,
-        )
-        self._network_thread.start()
-
-        deadline = time.monotonic() + 60.0
-        while time.monotonic() < deadline and not self.stats.send_succeeded:
-            time.sleep(0.1)
-
-        if self._network_thread.is_alive():
-            self._stop.set()
-            self._network_thread.join(timeout=5.0)
+        self.stats.reconnect_events = self.sock.reconnect_events
         return self.stats
 
     def _network_loop_separate_with_strategy(self) -> None:
-        """Variante réseau qui gère aussi les reconnect selon stratégie."""
         self.sock.connect()
         if not self._send_ready_and_wait_ack():
             self._stop.set()
@@ -500,6 +620,17 @@ class Worker:
                     if msg.msg_type == MsgType.JOB and not job_received:
                         log.info("APP job_received job_id=%s", msg.job_id)
                         job_received = True
+                        self._current_job_id = msg.job_id
+                        self.stats.job_id = msg.job_id
+                        if self.timeline:
+                            self.timeline.emit(
+                                "JOB_RECEIVED",
+                                component="worker",
+                                worker_id=self.config.worker_id,
+                                session_id=msg.session_id,
+                                socket_generation=msg.socket_generation,
+                                job_id=msg.job_id,
+                            )
                         threading.Thread(
                             target=self._job_worker_separate,
                             args=(msg.job_id,),
@@ -509,6 +640,7 @@ class Worker:
                         self._handle_heartbeat(msg)
                     elif msg.msg_type == MsgType.RESULT_ACK:
                         self.stats.result_ack_received = True
+                        self.stats.session_validated_result_ack = True
 
     def _job_worker_separate(self, job_id: str) -> None:
         self._execute_job_blocking(job_id)
@@ -519,6 +651,24 @@ class Worker:
         self.config.strategy = strategy  # type: ignore[assignment]
         self._apply_post_job_strategy(job_id)
         self.config.strategy = saved
+
+    def _run_separate_job_thread(self) -> WorkerStats:
+        self._network_thread = threading.Thread(
+            target=self._network_loop_separate_with_strategy,
+            name="worker-network",
+            daemon=True,
+        )
+        self._network_thread.start()
+
+        deadline = time.monotonic() + 60.0
+        while time.monotonic() < deadline and not self.stats.send_succeeded:
+            time.sleep(0.1)
+
+        if self._network_thread.is_alive():
+            self._stop.set()
+            self._network_thread.join(timeout=5.0)
+        self.stats.reconnect_events = self.sock.reconnect_events
+        return self.stats
 
     def run(self) -> WorkerStats:
         global log
@@ -539,6 +689,13 @@ class Worker:
             return self._run_blocking_network_loop()
         finally:
             self.sock.shutdown()
+
+    def session_validation_mode(self) -> SessionValidationMode:
+        if self.config.strategy == "manual-reconnect-heartbeat":
+            return SessionValidationMode.HEARTBEAT
+        if self.config.strategy == "manual-reconnect-ready-ack":
+            return SessionValidationMode.READY_ACK
+        return SessionValidationMode.RESULT_ACK
 
 
 def parse_args() -> argparse.Namespace:
@@ -569,6 +726,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--liveness-multiplier", type=float, default=None)
     parser.add_argument("--reconnect-delay", type=float, default=0.0)
     parser.add_argument("--reply-delay", type=float, default=0.0)
+    parser.add_argument("--network-delay", type=float, default=0.0)
     parser.add_argument("--result-ack-timeout", type=float, default=2.0)
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--no-monitor", action="store_true")
@@ -591,6 +749,7 @@ def main() -> None:
         send_mode=args.send_mode,
         reconnect_delay=args.reconnect_delay,
         reply_delay=args.reply_delay,
+        network_delay=args.network_delay,
         result_ack_timeout=args.result_ack_timeout,
         zmq_options=zmq_options_from_args(args),
         monitor_enabled=not args.no_monitor,
@@ -608,9 +767,13 @@ def main() -> None:
     worker = Worker(cfg)
     stats = worker.run()
     log.info(
-        "Worker finished send_succeeded=%s result_ack=%s",
+        "Worker finished send_succeeded=%s result_ack=%s "
+        "session_hb=%s session_ready=%s session_result_ack=%s",
         stats.send_succeeded,
         stats.result_ack_received,
+        stats.session_validated_heartbeat,
+        stats.session_validated_ready_ack,
+        stats.session_validated_result_ack,
     )
 
 
