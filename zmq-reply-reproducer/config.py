@@ -127,6 +127,8 @@ class ScenarioConfig:
     report_path: str = ""
     result_payload_bytes: int = 0
     payload_jitter: float = 0.0
+    trace_dir: str = ""
+    trace_label: str = ""
 
 
 @dataclass
@@ -152,6 +154,8 @@ class CampaignConfig:
     verbose: bool = False
     avg_payload_bytes: int = 20 * 1024 * 1024
     payload_jitter: float = 0.15
+    trace_dir: str = ""
+    trace_label: str = ""
 
 
 def apply_production_timings(cfg: BrokerConfig | WorkerConfig) -> None:

@@ -6,9 +6,11 @@ from __future__ import annotations
 import argparse
 import random
 import socket
+import sys
 import threading
 import time
 import uuid
+from contextlib import nullcontext
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -37,6 +39,7 @@ from timeline import (
     print_campaign_report,
     save_campaign_report,
 )
+from trace_store import TraceSession
 from worker import Worker
 
 log = setup_logging("campaign", "WARNING")
@@ -110,6 +113,8 @@ def run_single_campaign_scenario(
     base_job_duration: float,
     rng: random.Random,
     run_index: int,
+    trace: TraceSession | None = None,
+    quiet: bool = True,
 ) -> RunOutcome:
     run_id = str(uuid.uuid4())
     port = free_port()
@@ -133,150 +138,159 @@ def run_single_campaign_scenario(
     scenario_timeout = cfg.scenario_timeout + payload_timeout_bonus(
         result_payload_bytes
     )
-    log_level = "INFO" if cfg.verbose else "ERROR"
+    log_level = "INFO" if trace else ("INFO" if cfg.verbose else "ERROR")
 
     timeline = TimelineCollector(run_id=run_id, enabled=cfg.timeline_enabled)
 
-    broker_cfg = BrokerConfig(
-        endpoint=endpoint,
-        heartbeat_interval=hb_interval,
-        liveness_multiplier=LIVENESS_MULTIPLIER,
-        result_policy=cfg.result_policy,
-        zmq_options=ZmqSocketOptions(
-            immediate=scenario.zmq_immediate or cfg.zmq_immediate,
-            linger=cfg.zmq_linger,
-            reconnect_ivl=cfg.zmq_reconnect_ivl,
-            reconnect_ivl_max=cfg.zmq_reconnect_ivl_max,
-            sndtimeo=cfg.zmq_sndtimeo,
-        ),
-        monitor_enabled=cfg.monitor_enabled,
-        log_level=log_level,
+    capture_ctx = (
+        trace.begin_run(scenario.name, run_index, quiet=quiet)
+        if trace
+        else nullcontext()
     )
 
-    worker_cfg = WorkerConfig(
-        broker_endpoint=endpoint,
-        worker_id=f"worker-{port}-{run_index}",
-        strategy=scenario.strategy,  # type: ignore[arg-type]
-        reconnect_mode=scenario.reconnect_mode,  # type: ignore[arg-type]
-        threading_mode=cfg.threading_mode,
-        job_duration=job_duration,
-        heartbeat_interval=hb_interval,
-        liveness_multiplier=LIVENESS_MULTIPLIER,
-        reconnect_delay=reconnect_delay,
-        reply_delay=reply_delay,
-        network_delay=network_delay,
-        result_ack_timeout=1.5,
-        result_payload_bytes=result_payload_bytes,
-        payload_seed=payload_seed,
-        zmq_options=ZmqSocketOptions(
-            immediate=scenario.zmq_immediate or cfg.zmq_immediate,
-            linger=cfg.zmq_linger,
-            reconnect_ivl=cfg.zmq_reconnect_ivl,
-            reconnect_ivl_max=cfg.zmq_reconnect_ivl_max,
-            sndtimeo=cfg.zmq_sndtimeo,
-        ),
-        monitor_enabled=cfg.monitor_enabled,
-        log_level=log_level,
-    )
-
-    broker = Broker(broker_cfg, timeline=timeline, run_id=run_id)
-    broker_stats_holder: list[Any] = []
-    broker_error: list[Exception] = []
-
-    def broker_thread() -> None:
-        try:
-            stats = broker.run_once(
-                auto_dispatch=True,
-                timeout=scenario_timeout,
-            )
-            broker_stats_holder.append(stats)
-        except Exception as exc:
-            broker_error.append(exc)
-        finally:
-            broker.shutdown()
-
-    bt = threading.Thread(target=broker_thread, daemon=True)
-    bt.start()
-    time.sleep(0.3)
-
-    worker = Worker(worker_cfg, timeline=timeline, run_id=run_id)
-    worker_stats = worker.run()
-
-    bt.join(timeout=scenario_timeout + 3)
-    if broker_error:
-        log.error("Broker error in run %s: %s", run_id, broker_error[0])
-
-    bstats = broker_stats_holder[0] if broker_stats_holder else broker.stats
-
-    # Reclassifier avec les stats worker pour les cas 1 et 3
-    if worker_stats.send_succeeded and not bstats.raw_message_received:
-        bstats.transport_case = TransportCase.CASE1_SEND_NO_RECV
-        bstats.result_missing = True
-    elif bstats.result_accepted and not worker_stats.result_ack_received:
-        bstats.transport_case = TransportCase.CASE3_ACCEPTED_ACK_LOST
-    elif bstats.result_accepted and worker_stats.result_ack_received:
-        bstats.transport_case = TransportCase.SUCCESS
-
-    session_mode = worker.session_validation_mode().value
-
-    outcome = RunOutcome(
-        run_id=run_id,
-        scenario=scenario.name,
-        strategy=scenario.strategy,
-        reconnect_mode=scenario.reconnect_mode,
-        session_validation=session_mode,
-        worker_expired=bstats.worker_expired,
-        send_succeeded=worker_stats.send_succeeded,
-        raw_message_received=bstats.raw_message_received,
-        result_accepted=bstats.result_accepted,
-        result_rejected=bstats.result_rejected,
-        result_missing=bstats.result_missing,
-        result_ack_received=worker_stats.result_ack_received,
-        routing_id_changes=bstats.routing_id_changes,
-        session_changes=bstats.session_changes,
-        reconnect_events=max(
-            bstats.reconnect_events, worker_stats.reconnect_events
-        ),
-        session_validated_heartbeat=worker_stats.session_validated_heartbeat,
-        session_validated_ready_ack=worker_stats.session_validated_ready_ack,
-        session_validated_result_ack=worker_stats.session_validated_result_ack,
-        reject_reason=bstats.reject_reason,
-        job_id=bstats.job_id or worker_stats.job_id,
-        seed=cfg.seed,
-        parameters={
-            "job_duration": job_duration,
-            "reconnect_delay": reconnect_delay,
-            "reply_delay": reply_delay,
-            "network_delay": network_delay,
-            "result_payload_bytes": result_payload_bytes,
-            "payload_seed": payload_seed,
-            "heartbeat_interval": hb_interval,
-            "worker_timeout": worker_timeout,
-            "zmq_immediate": scenario.zmq_immediate,
-            "run_index": run_index,
-        },
-    )
-    outcome.transport_case = classify_transport_case(outcome)
-
-    if worker_stats.send_succeeded and not bstats.raw_message_received:
-        outcome.transport_case = TransportCase.CASE1_SEND_NO_RECV
-    elif bstats.result_accepted and not worker_stats.result_ack_received:
-        outcome.transport_case = TransportCase.CASE3_ACCEPTED_ACK_LOST
-
-    if cfg.print_timelines and outcome.job_id:
-        timeline.print_timeline(outcome.job_id)
-
-    if cfg.verbose:
-        print(
-            f"  [{scenario.name}] case={outcome.transport_case.value} "
-            f"send={outcome.send_succeeded} rx={outcome.raw_message_received} "
-            f"accepted={outcome.result_accepted} ack={outcome.result_ack_received}"
+    with capture_ctx as capture:
+        broker_cfg = BrokerConfig(
+            endpoint=endpoint,
+            heartbeat_interval=hb_interval,
+            liveness_multiplier=LIVENESS_MULTIPLIER,
+            result_policy=cfg.result_policy,
+            zmq_options=ZmqSocketOptions(
+                immediate=scenario.zmq_immediate or cfg.zmq_immediate,
+                linger=cfg.zmq_linger,
+                reconnect_ivl=cfg.zmq_reconnect_ivl,
+                reconnect_ivl_max=cfg.zmq_reconnect_ivl_max,
+                sndtimeo=cfg.zmq_sndtimeo,
+            ),
+            monitor_enabled=cfg.monitor_enabled,
+            log_level=log_level,
         )
+
+        worker_cfg = WorkerConfig(
+            broker_endpoint=endpoint,
+            worker_id=f"worker-{port}-{run_index}",
+            strategy=scenario.strategy,  # type: ignore[arg-type]
+            reconnect_mode=scenario.reconnect_mode,  # type: ignore[arg-type]
+            threading_mode=cfg.threading_mode,
+            job_duration=job_duration,
+            heartbeat_interval=hb_interval,
+            liveness_multiplier=LIVENESS_MULTIPLIER,
+            reconnect_delay=reconnect_delay,
+            reply_delay=reply_delay,
+            network_delay=network_delay,
+            result_ack_timeout=1.5,
+            result_payload_bytes=result_payload_bytes,
+            payload_seed=payload_seed,
+            zmq_options=ZmqSocketOptions(
+                immediate=scenario.zmq_immediate or cfg.zmq_immediate,
+                linger=cfg.zmq_linger,
+                reconnect_ivl=cfg.zmq_reconnect_ivl,
+                reconnect_ivl_max=cfg.zmq_reconnect_ivl_max,
+                sndtimeo=cfg.zmq_sndtimeo,
+            ),
+            monitor_enabled=cfg.monitor_enabled,
+            log_level=log_level,
+        )
+
+        broker = Broker(broker_cfg, timeline=timeline, run_id=run_id)
+        broker_stats_holder: list[Any] = []
+        broker_error: list[Exception] = []
+
+        def broker_thread() -> None:
+            try:
+                stats = broker.run_once(
+                    auto_dispatch=True,
+                    timeout=scenario_timeout,
+                )
+                broker_stats_holder.append(stats)
+            except Exception as exc:
+                broker_error.append(exc)
+            finally:
+                broker.shutdown()
+
+        bt = threading.Thread(target=broker_thread, daemon=True)
+        bt.start()
+        time.sleep(0.3)
+
+        worker = Worker(worker_cfg, timeline=timeline, run_id=run_id)
+        worker_stats = worker.run()
+
+        bt.join(timeout=scenario_timeout + 3)
+        if broker_error:
+            log.error("Broker error in run %s: %s", run_id, broker_error[0])
+
+        bstats = broker_stats_holder[0] if broker_stats_holder else broker.stats
+
+        if worker_stats.send_succeeded and not bstats.raw_message_received:
+            bstats.transport_case = TransportCase.CASE1_SEND_NO_RECV
+            bstats.result_missing = True
+        elif bstats.result_accepted and not worker_stats.result_ack_received:
+            bstats.transport_case = TransportCase.CASE3_ACCEPTED_ACK_LOST
+        elif bstats.result_accepted and worker_stats.result_ack_received:
+            bstats.transport_case = TransportCase.SUCCESS
+
+        session_mode = worker.session_validation_mode().value
+
+        outcome = RunOutcome(
+            run_id=run_id,
+            scenario=scenario.name,
+            strategy=scenario.strategy,
+            reconnect_mode=scenario.reconnect_mode,
+            session_validation=session_mode,
+            worker_expired=bstats.worker_expired,
+            send_succeeded=worker_stats.send_succeeded,
+            raw_message_received=bstats.raw_message_received,
+            result_accepted=bstats.result_accepted,
+            result_rejected=bstats.result_rejected,
+            result_missing=bstats.result_missing,
+            result_ack_received=worker_stats.result_ack_received,
+            routing_id_changes=bstats.routing_id_changes,
+            session_changes=bstats.session_changes,
+            reconnect_events=max(
+                bstats.reconnect_events, worker_stats.reconnect_events
+            ),
+            session_validated_heartbeat=worker_stats.session_validated_heartbeat,
+            session_validated_ready_ack=worker_stats.session_validated_ready_ack,
+            session_validated_result_ack=worker_stats.session_validated_result_ack,
+            reject_reason=bstats.reject_reason,
+            job_id=bstats.job_id or worker_stats.job_id,
+            seed=cfg.seed,
+            parameters={
+                "job_duration": job_duration,
+                "reconnect_delay": reconnect_delay,
+                "reply_delay": reply_delay,
+                "network_delay": network_delay,
+                "result_payload_bytes": result_payload_bytes,
+                "payload_seed": payload_seed,
+                "heartbeat_interval": hb_interval,
+                "worker_timeout": worker_timeout,
+                "zmq_immediate": scenario.zmq_immediate,
+                "run_index": run_index,
+            },
+        )
+        outcome.transport_case = classify_transport_case(outcome)
+
+        if worker_stats.send_succeeded and not bstats.raw_message_received:
+            outcome.transport_case = TransportCase.CASE1_SEND_NO_RECV
+        elif bstats.result_accepted and not worker_stats.result_ack_received:
+            outcome.transport_case = TransportCase.CASE3_ACCEPTED_ACK_LOST
+
+        if cfg.print_timelines and outcome.job_id:
+            timeline.print_timeline(outcome.job_id)
+
+        if cfg.verbose:
+            print(
+                f"  [{scenario.name}] case={outcome.transport_case.value} "
+                f"send={outcome.send_succeeded} rx={outcome.raw_message_received} "
+                f"accepted={outcome.result_accepted} ack={outcome.result_ack_received}"
+            )
+
+        if trace and capture is not None:
+            capture.save(outcome=outcome, timeline=timeline)
 
     return outcome
 
 
-def run_campaign(cfg: CampaignConfig) -> list[RunOutcome]:
+def run_campaign(cfg: CampaignConfig, trace: TraceSession | None = None) -> list[RunOutcome]:
     rng = random.Random(cfg.seed)
 
     heartbeat_interval = HEARTBEAT_INTERVAL
@@ -310,6 +324,8 @@ def run_campaign(cfg: CampaignConfig) -> list[RunOutcome]:
             base_job_duration,
             rng,
             run_index=i,
+            trace=trace,
+            quiet=not cfg.verbose,
         )
         outcomes.append(outcome)
         if (i + 1) % 50 == 0:
@@ -351,6 +367,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--report", default="campaign_report.json")
     parser.add_argument("--print-timelines", action="store_true")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--trace-dir", default="", help="Répertoire d'archivage des traces")
+    parser.add_argument("--trace-label", default="", help="Libellé de session")
+    parser.add_argument("--save-traces", action="store_true", help="Archive dans traces/")
     return parser.parse_args()
 
 
@@ -376,15 +395,41 @@ def main() -> None:
         report_path=args.report,
         print_timelines=args.print_timelines,
         verbose=args.verbose,
+        trace_dir=args.trace_dir or ("traces" if args.save_traces else ""),
+        trace_label=args.trace_label,
     )
 
-    outcomes = run_campaign(cfg)
+    trace_session: TraceSession | None = None
+    if cfg.trace_dir:
+        trace_session = TraceSession(
+            cfg.trace_dir,
+            source="campaign",
+            label=cfg.trace_label,
+            seed=cfg.seed,
+            command=" ".join(sys.argv),
+            config={
+                "runs": cfg.runs,
+                "jitter": cfg.jitter,
+                "result_policy": cfg.result_policy,
+                "avg_payload_bytes": cfg.avg_payload_bytes,
+            },
+        )
+        trace_session.enable_stdout_tee()
+
+    outcomes = run_campaign(cfg, trace=trace_session)
     report = build_campaign_report(cfg.seed, outcomes)
     print_campaign_report(report)
 
     if cfg.report_path:
         save_campaign_report(report, cfg.report_path)
         print(f"\nRapport JSON: {cfg.report_path}")
+
+    if trace_session:
+        path = trace_session.finalize(
+            summary_data=report.to_dict(),
+            outcomes=outcomes,
+        )
+        print(f"\nTraces archivées: {path}")
 
 
 if __name__ == "__main__":
