@@ -26,6 +26,9 @@ class WorkerState(str, Enum):
     READY = "READY"
     BUSY = "BUSY"
     EXPIRED = "EXPIRED"
+    REMOVED = "REMOVED"
+    RECONNECTED = "RECONNECTED"
+    UNKNOWN = "UNKNOWN"
 
 
 @dataclass
@@ -87,21 +90,53 @@ def summarize_frames(frames: list[bytes]) -> list[str]:
     return [frame_summary(f) for f in frames]
 
 
+def _correlation_suffix(
+    *,
+    job_id: str = "",
+    worker_id: str = "",
+    session_id: str = "",
+    socket_generation: int = 0,
+    routing_id: str | bytes | None = "",
+) -> str:
+    rid = ""
+    if isinstance(routing_id, bytes):
+        rid = routing_id.hex()
+    elif routing_id:
+        rid = str(routing_id)
+    return (
+        f"job_id={job_id or 'N/A'} worker_id={worker_id or 'N/A'} "
+        f"session_id={session_id or 'N/A'} socket_generation={socket_generation} "
+        f"routing_id={rid or 'N/A'}"
+    )
+
+
 def log_transport_recv(
     log: logging.Logger,
     routing_id: bytes | None,
     frames: list[bytes],
     component: str,
+    *,
+    job_id: str = "",
+    worker_id: str = "",
+    session_id: str = "",
+    socket_generation: int = 0,
 ) -> None:
+    corr = _correlation_suffix(
+        job_id=job_id,
+        worker_id=worker_id,
+        session_id=session_id,
+        socket_generation=socket_generation,
+        routing_id=routing_id,
+    )
     log.info(
-        "TRANSPORT_RECV component=%s mono_ts=%.6f wall_ts=%.6f routing_id=%s "
-        "frame_count=%d frames=%s",
+        "TRANSPORT_RECV component=%s mono_ts=%.6f wall_ts=%.6f "
+        "frame_count=%d frames=%s %s",
         component,
         time.monotonic(),
         time.time(),
-        routing_id.hex() if routing_id else "N/A",
         len(frames),
         summarize_frames(frames),
+        corr,
     )
 
 
@@ -116,16 +151,25 @@ def log_send_result(
     session_id: str,
     error: str | None = None,
     errno: int | None = None,
+    job_id: str = "",
+    worker_id: str = "",
+    routing_id: str | bytes | None = "",
 ) -> None:
+    corr = _correlation_suffix(
+        job_id=job_id,
+        worker_id=worker_id,
+        session_id=session_id,
+        socket_generation=socket_generation,
+        routing_id=routing_id,
+    )
     log.info(
         "SEND_RESULT component=%s msg_type=%s success=%s duration_ms=%.3f "
-        "socket_generation=%d session_id=%s error=%s errno=%s",
+        "error=%s errno=%s %s",
         component,
         msg_type,
         success,
         duration_ms,
-        socket_generation,
-        session_id,
         error,
         errno,
+        corr,
     )

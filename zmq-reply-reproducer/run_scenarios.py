@@ -8,7 +8,8 @@ import random
 import socket
 import threading
 import time
-from dataclasses import dataclass, field
+import uuid
+from dataclasses import dataclass
 from typing import Any
 
 from broker import Broker
@@ -16,11 +17,21 @@ from config import (
     HEARTBEAT_INTERVAL,
     JOB_DURATION,
     LIVENESS_MULTIPLIER,
+    BrokerConfig,
     ScenarioConfig,
     WorkerConfig,
     ZmqSocketOptions,
 )
 from logging_setup import setup_logging
+from timeline import (
+    RunOutcome,
+    TimelineCollector,
+    TransportCase,
+    build_campaign_report,
+    classify_transport_case,
+    print_campaign_report,
+    save_campaign_report,
+)
 from worker import Worker
 
 log = setup_logging("scenarios", "WARNING")
@@ -32,10 +43,10 @@ def free_port() -> int:
         return s.getsockname()[1]
 
 
-def apply_jitter(value: float, jitter: float) -> float:
+def apply_jitter(rng: random.Random, value: float, jitter: float) -> float:
     if jitter <= 0:
         return value
-    factor = 1.0 + random.uniform(-jitter, jitter)
+    factor = 1.0 + rng.uniform(-jitter, jitter)
     return max(0.01, value * factor)
 
 
@@ -44,10 +55,11 @@ class ScenarioDef:
     name: str
     strategy: str
     reconnect_mode: str = "full"
-    job_duration: float | None = None  # None = use default long job
+    job_duration: float | None = None
     short_job: bool = False
     reconnect_delay: float = 0.0
     reply_delay: float = 0.0
+    network_delay: float = 0.0
     zmq_immediate: int = 0
 
 
@@ -60,6 +72,9 @@ class RunResult:
     result_accepted: bool = False
     result_rejected: bool = False
     result_missing: bool = True
+    result_ack_received: bool = False
+    transport_case: str = ""
+    job_id: str = ""
 
 
 @dataclass
@@ -72,6 +87,9 @@ class ScenarioSummary:
     result_accepted: int = 0
     result_rejected: int = 0
     result_missing: int = 0
+    case1_send_no_recv: int = 0
+    case2_recv_rejected: int = 0
+    case3_ack_lost: int = 0
 
     @property
     def success_rate(self) -> float:
@@ -119,25 +137,29 @@ def run_single_scenario(
     heartbeat_interval: float,
     worker_timeout: float,
     base_job_duration: float,
+    rng: random.Random,
     quiet: bool = True,
+    run_index: int = 0,
 ) -> RunResult:
+    run_id = str(uuid.uuid4())
     port = free_port()
     endpoint = f"tcp://127.0.0.1:{port}"
 
-    hb_interval = apply_jitter(heartbeat_interval, cfg.jitter)
+    hb_interval = apply_jitter(rng, heartbeat_interval, cfg.jitter)
     job_duration = base_job_duration
     if scenario.short_job:
         job_duration = worker_timeout * 0.4
     elif scenario.job_duration is not None:
         job_duration = scenario.job_duration
     else:
-        job_duration = apply_jitter(base_job_duration, cfg.jitter)
+        job_duration = apply_jitter(rng, base_job_duration, cfg.jitter)
 
-    reconnect_delay = apply_jitter(scenario.reconnect_delay, cfg.jitter)
-    reply_delay = apply_jitter(scenario.reply_delay, cfg.jitter)
+    reconnect_delay = apply_jitter(rng, scenario.reconnect_delay, cfg.jitter)
+    reply_delay = apply_jitter(rng, scenario.reply_delay, cfg.jitter)
+    network_delay = apply_jitter(rng, scenario.network_delay, cfg.jitter)
     log_level = "ERROR" if quiet else "INFO"
 
-    from config import BrokerConfig
+    timeline = TimelineCollector(run_id=run_id, enabled=cfg.timeline_enabled)
 
     broker_cfg = BrokerConfig(
         endpoint=endpoint,
@@ -145,13 +167,13 @@ def run_single_scenario(
         liveness_multiplier=LIVENESS_MULTIPLIER,
         result_policy=cfg.result_policy,
         zmq_options=ZmqSocketOptions(
-            immediate=cfg.zmq_immediate,
+            immediate=scenario.zmq_immediate or cfg.zmq_immediate,
             linger=cfg.zmq_linger,
             reconnect_ivl=cfg.zmq_reconnect_ivl,
             reconnect_ivl_max=cfg.zmq_reconnect_ivl_max,
             sndtimeo=cfg.zmq_sndtimeo,
         ),
-        monitor_enabled=False,
+        monitor_enabled=cfg.monitor_enabled,
         log_level=log_level,
     )
 
@@ -166,6 +188,7 @@ def run_single_scenario(
         liveness_multiplier=LIVENESS_MULTIPLIER,
         reconnect_delay=reconnect_delay,
         reply_delay=reply_delay,
+        network_delay=network_delay,
         result_ack_timeout=1.0,
         zmq_options=ZmqSocketOptions(
             immediate=scenario.zmq_immediate or cfg.zmq_immediate,
@@ -174,11 +197,11 @@ def run_single_scenario(
             reconnect_ivl_max=cfg.zmq_reconnect_ivl_max,
             sndtimeo=cfg.zmq_sndtimeo,
         ),
-        monitor_enabled=False,
+        monitor_enabled=cfg.monitor_enabled,
         log_level=log_level,
     )
 
-    broker = Broker(broker_cfg)
+    broker = Broker(broker_cfg, timeline=timeline, run_id=run_id)
     broker_stats_holder: list[Any] = []
     broker_error: list[Exception] = []
 
@@ -198,7 +221,7 @@ def run_single_scenario(
     bt.start()
     time.sleep(0.3)
 
-    worker = Worker(worker_cfg)
+    worker = Worker(worker_cfg, timeline=timeline, run_id=run_id)
     worker_stats = worker.run()
 
     bt.join(timeout=cfg.scenario_timeout + 3)
@@ -207,7 +230,32 @@ def run_single_scenario(
 
     bstats = broker_stats_holder[0] if broker_stats_holder else broker.stats
 
-    result = RunResult(
+    outcome = RunOutcome(
+        run_id=run_id,
+        scenario=scenario.name,
+        strategy=scenario.strategy,
+        reconnect_mode=scenario.reconnect_mode,
+        session_validation=worker.session_validation_mode().value,
+        worker_expired=bstats.worker_expired,
+        send_succeeded=worker_stats.send_succeeded,
+        raw_message_received=bstats.raw_message_received,
+        result_accepted=bstats.result_accepted,
+        result_rejected=bstats.result_rejected,
+        result_missing=bstats.result_missing,
+        result_ack_received=worker_stats.result_ack_received,
+        reject_reason=bstats.reject_reason,
+        job_id=bstats.job_id or worker_stats.job_id,
+    )
+    transport = classify_transport_case(outcome)
+    if worker_stats.send_succeeded and not bstats.raw_message_received:
+        transport = TransportCase.CASE1_SEND_NO_RECV
+    elif bstats.result_accepted and not worker_stats.result_ack_received:
+        transport = TransportCase.CASE3_ACCEPTED_ACK_LOST
+
+    if not quiet and outcome.job_id:
+        timeline.print_timeline(outcome.job_id)
+
+    return RunResult(
         scenario=scenario.name,
         worker_expired=bstats.worker_expired,
         send_succeeded=worker_stats.send_succeeded,
@@ -215,8 +263,10 @@ def run_single_scenario(
         result_accepted=bstats.result_accepted,
         result_rejected=bstats.result_rejected,
         result_missing=bstats.result_missing,
+        result_ack_received=worker_stats.result_ack_received,
+        transport_case=transport.value,
+        job_id=outcome.job_id,
     )
-    return result
 
 
 def aggregate_results(results: list[RunResult]) -> dict[str, ScenarioSummary]:
@@ -238,6 +288,12 @@ def aggregate_results(results: list[RunResult]) -> dict[str, ScenarioSummary]:
             s.result_rejected += 1
         if r.result_missing:
             s.result_missing += 1
+        if r.transport_case == TransportCase.CASE1_SEND_NO_RECV.value:
+            s.case1_send_no_recv += 1
+        elif r.transport_case == TransportCase.CASE2_RECV_REJECTED.value:
+            s.case2_recv_rejected += 1
+        elif r.transport_case == TransportCase.CASE3_ACCEPTED_ACK_LOST.value:
+            s.case3_ack_lost += 1
     return summaries
 
 
@@ -245,7 +301,7 @@ def print_summary(summaries: dict[str, ScenarioSummary]) -> None:
     header = (
         f"{'strategy':<45} {'runs':>5} {'expired':>8} {'send_ok':>8} "
         f"{'raw_rx':>7} {'accepted':>9} {'rejected':>9} {'missing':>8} "
-        f"{'success%':>9}"
+        f"{'case1':>6} {'case2':>6} {'case3':>6} {'success%':>9}"
     )
     print(header)
     print("-" * len(header))
@@ -255,7 +311,9 @@ def print_summary(summaries: dict[str, ScenarioSummary]) -> None:
             f"{s.scenario:<45} {s.runs:>5} {s.worker_expired:>8} "
             f"{s.send_succeeded:>8} {s.raw_message_received:>7} "
             f"{s.result_accepted:>9} {s.result_rejected:>9} "
-            f"{s.result_missing:>8} {s.success_rate:>8.1f}%"
+            f"{s.result_missing:>8} {s.case1_send_no_recv:>6} "
+            f"{s.case2_recv_rejected:>6} {s.case3_ack_lost:>6} "
+            f"{s.success_rate:>8.1f}%"
         )
 
 
@@ -263,6 +321,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Run ZMQ reply-loss scenarios")
     parser.add_argument("--runs", type=int, default=20)
     parser.add_argument("--jitter", type=float, default=0.0)
+    parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--production", action="store_true")
     parser.add_argument("--result-policy", choices=["strict", "job-id"], default="strict")
     parser.add_argument(
@@ -274,6 +333,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--zmq-immediate", type=int, default=0, choices=[0, 1])
     parser.add_argument("--scenarios", nargs="*", help="Subset of scenario names")
     parser.add_argument("--verbose", action="store_true")
+    parser.add_argument("--no-monitor", action="store_true")
+    parser.add_argument("--report", default="", help="Chemin rapport JSON")
     return parser.parse_args()
 
 
@@ -282,6 +343,9 @@ def main() -> None:
     if args.verbose:
         global log
         log = setup_logging("scenarios", "INFO")
+
+    seed = args.seed if args.seed is not None else int(time.time())
+    rng = random.Random(seed)
 
     heartbeat_interval = HEARTBEAT_INTERVAL
     liveness_multiplier = LIVENESS_MULTIPLIER
@@ -304,6 +368,9 @@ def main() -> None:
         threading_mode=args.threading_mode,
         scenario_timeout=args.scenario_timeout,
         zmq_immediate=args.zmq_immediate,
+        seed=seed,
+        monitor_enabled=not args.no_monitor,
+        report_path=args.report,
     )
 
     scenarios = DEFAULT_SCENARIOS
@@ -312,25 +379,59 @@ def main() -> None:
         scenarios = [s for s in DEFAULT_SCENARIOS if s.name in names]
 
     print(
-        f"Running {args.runs} iterations per scenario "
+        f"Running {args.runs} iterations per scenario (seed={seed}) "
         f"(heartbeat={heartbeat_interval}s, timeout={worker_timeout}s, "
         f"job={base_job_duration}s, jitter={args.jitter})"
     )
     print()
 
     all_results: list[RunResult] = []
+    all_outcomes: list[RunOutcome] = []
     for scenario in scenarios:
         for i in range(args.runs):
             result = run_single_scenario(
-                scenario, cfg, heartbeat_interval, worker_timeout, base_job_duration,
+                scenario,
+                cfg,
+                heartbeat_interval,
+                worker_timeout,
+                base_job_duration,
+                rng,
                 quiet=not args.verbose,
+                run_index=i,
             )
             all_results.append(result)
             if args.verbose:
-                print(f"  [{scenario.name} run {i+1}] {result}")
+                print(
+                    f"  [{scenario.name} run {i+1}] {result} "
+                    f"case={result.transport_case}"
+                )
 
     summaries = aggregate_results(all_results)
     print_summary(summaries)
+
+    if args.report:
+        for r in all_results:
+            all_outcomes.append(
+                RunOutcome(
+                    run_id="",
+                    scenario=r.scenario,
+                    strategy="",
+                    reconnect_mode="",
+                    session_validation="",
+                    worker_expired=r.worker_expired,
+                    send_succeeded=r.send_succeeded,
+                    raw_message_received=r.raw_message_received,
+                    result_accepted=r.result_accepted,
+                    result_rejected=r.result_rejected,
+                    result_missing=r.result_missing,
+                    result_ack_received=r.result_ack_received,
+                    job_id=r.job_id,
+                    seed=seed,
+                )
+            )
+        report = build_campaign_report(seed, all_outcomes)
+        save_campaign_report(report, args.report)
+        print(f"\nRapport JSON: {args.report}")
 
 
 if __name__ == "__main__":

@@ -93,6 +93,7 @@ class WorkerConfig:
     liveness_multiplier: float = LIVENESS_MULTIPLIER
     reconnect_delay: float = 0.0
     reply_delay: float = 0.0
+    network_delay: float = 0.0
     result_ack_timeout: float = 2.0
     zmq_options: ZmqSocketOptions = field(default_factory=ZmqSocketOptions)
     monitor_enabled: bool = True
@@ -118,6 +119,33 @@ class ScenarioConfig:
     zmq_reconnect_ivl_max: int = 0
     zmq_sndtimeo: int = -1
     scenario_timeout: float = 15.0
+    seed: int | None = None
+    monitor_enabled: bool = True
+    timeline_enabled: bool = True
+    report_path: str = ""
+
+
+@dataclass
+class CampaignConfig:
+    """Configuration pour campagnes de stress à grande échelle."""
+
+    runs: int = 300
+    seed: int = 42
+    jitter: float = 0.15
+    production: bool = False
+    result_policy: ResultPolicy = "strict"
+    threading_mode: ThreadingMode = "blocking-network-loop"
+    scenario_timeout: float = 20.0
+    zmq_immediate: int = 0
+    zmq_linger: int = 0
+    zmq_reconnect_ivl: int = 100
+    zmq_reconnect_ivl_max: int = 0
+    zmq_sndtimeo: int = -1
+    monitor_enabled: bool = True
+    timeline_enabled: bool = True
+    report_path: str = "campaign_report.json"
+    print_timelines: bool = False
+    verbose: bool = False
 
 
 def apply_production_timings(cfg: BrokerConfig | WorkerConfig) -> None:
