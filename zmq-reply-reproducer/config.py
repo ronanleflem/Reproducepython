@@ -95,6 +95,8 @@ class WorkerConfig:
     reply_delay: float = 0.0
     network_delay: float = 0.0
     result_ack_timeout: float = 2.0
+    ready_ack_timeout: float = 3.0
+    echo_heartbeat: bool = False
     result_payload_bytes: int = 0
     payload_seed: int = 0
     zmq_options: ZmqSocketOptions = field(default_factory=ZmqSocketOptions)
@@ -129,6 +131,8 @@ class ScenarioConfig:
     payload_jitter: float = 0.0
     trace_dir: str = ""
     trace_label: str = ""
+    echo_heartbeat: bool = False
+    ready_ack_timeout: float = 3.0
 
 
 @dataclass

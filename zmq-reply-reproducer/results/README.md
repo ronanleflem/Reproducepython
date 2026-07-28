@@ -8,6 +8,7 @@ Chaque sous-dossier correspond à une session archivée :
 |---------|-------------|
 | [20260727_reconnect-flakiness](20260727_reconnect-flakiness/REPORT.md) | Série #1 — intermittence des stratégies de reconnect (60 runs) |
 | [20260728_separate-job-thread](20260728_separate-job-thread/REPORT.md) | Série #2 — même campagne avec `separate-job-thread` (60 runs) |
+| [20260728_combination-matrix](20260728_combination-matrix/REPORT.md) | Série #3 — matrice 17 combinaisons × 7 leviers (170 runs) |
 
 ## Rejouer une campagne
 

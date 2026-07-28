@@ -349,8 +349,35 @@ class Worker:
             )
         if classification == "current_session":
             self.stats.session_validated_heartbeat = True
+        if self.config.echo_heartbeat:
+            self._echo_heartbeat(msg)
 
-    def _send_ready_and_wait_ack(self, timeout: float = 3.0) -> bool:
+    def _echo_heartbeat(self, incoming: Message) -> bool:
+        """Renvoie un HEARTBEAT au broker pour maintenir la vivacité côté broker."""
+        reply = Message(
+            msg_type=MsgType.HEARTBEAT,
+            worker_id=self.config.worker_id,
+            session_id=self.sock.session_id,
+            socket_generation=self.sock.socket_generation,
+            heartbeat_counter=incoming.heartbeat_counter,
+            timestamp=time.time(),
+        )
+        ok = self.sock.send_message(reply)
+        if ok and self.timeline:
+            self.timeline.emit(
+                "HEARTBEAT_ECHOED",
+                component="worker",
+                worker_id=self.config.worker_id,
+                session_id=self.sock.session_id,
+                socket_generation=self.sock.socket_generation,
+                job_id=self._current_job_id,
+                details={"heartbeat_counter": incoming.heartbeat_counter},
+            )
+        return ok
+
+    def _send_ready_and_wait_ack(self, timeout: float | None = None) -> bool:
+        if timeout is None:
+            timeout = self.config.ready_ack_timeout
         ready = Message(
             msg_type=MsgType.READY,
             worker_id=self.config.worker_id,
@@ -394,8 +421,10 @@ class Worker:
         return False
 
     def _wait_for_heartbeat(
-        self, expected_session: str | None = None, timeout: float = 3.0
+        self, expected_session: str | None = None, timeout: float | None = None
     ) -> bool:
+        if timeout is None:
+            timeout = 3.0
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
             msg = self.sock.recv_message(timeout_ms=500)
@@ -522,7 +551,7 @@ class Worker:
             self.sock.reconnect_socket()
             self.stats.manual_reconnect_performed = True
             if not self._wait_for_heartbeat(
-                expected_session=self.sock.session_id, timeout=3.0
+                expected_session=self.sock.session_id,
             ):
                 log.warning("APP heartbeat_wait_timeout after reconnect")
             return self._send_result(job_id)
