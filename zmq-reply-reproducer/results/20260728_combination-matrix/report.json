@@ -1,0 +1,27 @@
+{
+  "seed": 42,
+  "runs_per_combination": 10,
+  "baseline_success_rate": 50.0,
+  "total_runs": 170,
+  "session_id": "20260728T073229Z_seed42_combination-matrix",
+  "command": "run_combinations.py --runs 10 --seed 42 --no-monitor --save-traces --trace-label combination-matrix",
+  "combinations": [
+    {"rank": 1, "combination": "c02_echo_no_reconnect", "flags": ["separate-thread", "echo-hb", "no-reconnect"], "success_rate": 100.0, "delta_baseline": 50.0, "accepted": 10, "runs": 10, "expired": 0, "case1": 0, "case2": 0, "case3": 0},
+    {"rank": 2, "combination": "c14_stack_no_reconnect", "flags": ["separate-thread", "echo-hb", "no-reconnect"], "success_rate": 100.0, "delta_baseline": 50.0, "accepted": 10, "runs": 10, "expired": 0, "case1": 0, "case2": 0, "case3": 0},
+    {"rank": 3, "combination": "c01_separate_thread", "flags": ["separate-thread"], "success_rate": 60.0, "delta_baseline": 10.0, "accepted": 6, "runs": 10, "expired": 10, "case1": 4, "case2": 0, "case3": 6},
+    {"rank": 4, "combination": "c09_sep_heartbeat", "flags": ["separate-thread"], "success_rate": 60.0, "delta_baseline": 10.0, "accepted": 6, "runs": 10, "expired": 10, "case1": 4, "case2": 0, "case3": 6},
+    {"rank": 5, "combination": "c10_sep_ready_ack_10", "flags": ["separate-thread", "ready-ack", "ack10s"], "success_rate": 60.0, "delta_baseline": 10.0, "accepted": 6, "runs": 10, "expired": 10, "case1": 4, "case2": 0, "case3": 6},
+    {"rank": 6, "combination": "c15_stack_full", "flags": ["separate-thread", "echo-hb", "ready-ack", "ack10s", "light"], "success_rate": 60.0, "delta_baseline": 10.0, "accepted": 6, "runs": 10, "expired": 4, "case1": 4, "case2": 0, "case3": 6},
+    {"rank": 7, "combination": "c00_baseline", "flags": ["baseline"], "success_rate": 50.0, "delta_baseline": 0.0, "accepted": 5, "runs": 10, "expired": 10, "case1": 5, "case2": 0, "case3": 0},
+    {"rank": 8, "combination": "c05_ready_ack_10s", "flags": ["ready-ack", "ack10s"], "success_rate": 50.0, "delta_baseline": 0.0, "accepted": 5, "runs": 10, "expired": 10, "case1": 5, "case2": 0, "case3": 0},
+    {"rank": 9, "combination": "c12_sep_light", "flags": ["separate-thread", "light"], "success_rate": 40.0, "delta_baseline": -10.0, "accepted": 4, "runs": 10, "expired": 10, "case1": 6, "case2": 0, "case3": 0},
+    {"rank": 10, "combination": "c04_strategy_ready_ack", "flags": ["ready-ack"], "success_rate": 30.0, "delta_baseline": -20.0, "accepted": 3, "runs": 10, "expired": 10, "case1": 7, "case2": 0, "case3": 0},
+    {"rank": 11, "combination": "c08_zmq_immediate", "flags": ["zmq-imm"], "success_rate": 30.0, "delta_baseline": -20.0, "accepted": 3, "runs": 10, "expired": 10, "case1": 7, "case2": 0, "case3": 0},
+    {"rank": 12, "combination": "c11_echo_heartbeat_strategy", "flags": ["separate-thread", "echo-hb"], "success_rate": 30.0, "delta_baseline": -20.0, "accepted": 3, "runs": 10, "expired": 7, "case1": 7, "case2": 0, "case3": 3},
+    {"rank": 13, "combination": "c13_stack_transport", "flags": ["separate-thread", "echo-hb"], "success_rate": 30.0, "delta_baseline": -20.0, "accepted": 3, "runs": 10, "expired": 7, "case1": 7, "case2": 0, "case3": 3},
+    {"rank": 14, "combination": "c16_kitchen_sink", "flags": ["separate-thread", "echo-hb", "ready-ack", "ack10s", "light", "zmq-imm"], "success_rate": 30.0, "delta_baseline": -20.0, "accepted": 3, "runs": 10, "expired": 7, "case1": 7, "case2": 0, "case3": 3},
+    {"rank": 15, "combination": "c03_strategy_immediate", "flags": ["immediate"], "success_rate": 20.0, "delta_baseline": -30.0, "accepted": 2, "runs": 10, "expired": 10, "case1": 8, "case2": 0, "case3": 0},
+    {"rank": 16, "combination": "c07_reconnect_light", "flags": ["light"], "success_rate": 20.0, "delta_baseline": -30.0, "accepted": 2, "runs": 10, "expired": 10, "case1": 8, "case2": 0, "case3": 0},
+    {"rank": 17, "combination": "c06_policy_strict", "flags": ["strict"], "success_rate": 0.0, "delta_baseline": -50.0, "accepted": 0, "runs": 10, "expired": 10, "case1": 6, "case2": 4, "case3": 0}
+  ]
+}

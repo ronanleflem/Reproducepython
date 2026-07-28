@@ -247,7 +247,7 @@ def run_combination(
             result.expired += 1
         if run_result.transport_case == "CASE1_send_ok_broker_never_received":
             result.case1 += 1
-        elif run_result.transport_case == "CASE2_RECV_REJECTED":
+        elif run_result.transport_case == "CASE2_broker_received_then_rejected":
             result.case2 += 1
         elif "CASE3" in run_result.transport_case:
             result.case3 += 1
