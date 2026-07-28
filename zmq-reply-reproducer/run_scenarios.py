@@ -189,6 +189,9 @@ def run_single_scenario(
         "worker_timeout": worker_timeout,
         "scenario_timeout": scenario_timeout,
         "result_policy": cfg.result_policy,
+        "threading_mode": cfg.threading_mode,
+        "echo_heartbeat": cfg.echo_heartbeat,
+        "ready_ack_timeout": cfg.ready_ack_timeout,
         "run_index": run_index,
     }
 
@@ -228,6 +231,8 @@ def run_single_scenario(
             reply_delay=reply_delay,
             network_delay=network_delay,
             result_ack_timeout=1.0,
+            ready_ack_timeout=cfg.ready_ack_timeout,
+            echo_heartbeat=cfg.echo_heartbeat,
             result_payload_bytes=result_payload_bytes,
             payload_seed=payload_seed,
             zmq_options=ZmqSocketOptions(
