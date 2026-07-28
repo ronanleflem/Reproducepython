@@ -1,0 +1,23 @@
+{
+  "session_id": "20260728T062024Z_seed42_separate-job-thread",
+  "path": "traces/20260728T062024Z_seed42_separate-job-thread",
+  "source": "scenarios",
+  "label": "separate-job-thread",
+  "created_at": "2026-07-28T06:20:24.458258+00:00",
+  "seed": 42,
+  "command": "run_scenarios.py --runs 20 --seed 42 --scenarios job_gt_timeout_reconnect_then_ready_ack job_gt_timeout_reconnect_full_immediate job_gt_timeout_reconnect_then_heartbeat --result-payload-bytes 20971520 --result-policy job-id --threading-mode separate-job-thread --no-monitor --save-traces --trace-label separate-job-thread",
+  "config": {
+    "runs": 20,
+    "jitter": 0.0,
+    "result_policy": "job-id",
+    "result_payload_bytes": 20971520,
+    "payload_jitter": 0.15,
+    "scenarios": [
+      "job_gt_timeout_reconnect_full_immediate",
+      "job_gt_timeout_reconnect_then_heartbeat",
+      "job_gt_timeout_reconnect_then_ready_ack"
+    ]
+  },
+  "run_count": 60,
+  "threading_mode": "separate-job-thread"
+}
