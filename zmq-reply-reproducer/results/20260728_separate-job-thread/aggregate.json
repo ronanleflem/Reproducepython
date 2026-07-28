@@ -1,0 +1,25 @@
+{
+  "seed": 42,
+  "total_runs": 60,
+  "threading_mode": "separate-job-thread",
+  "success_by_strategy": {
+    "manual-reconnect-immediate": 7,
+    "manual-reconnect-heartbeat": 13,
+    "manual-reconnect-ready-ack": 7
+  },
+  "runs_by_strategy": {
+    "manual-reconnect-immediate": 20,
+    "manual-reconnect-heartbeat": 20,
+    "manual-reconnect-ready-ack": 20
+  },
+  "runs_by_transport_case": {
+    "CASE1_send_ok_broker_never_received": 33,
+    "CASE3_broker_accepted_ack_lost": 27
+  },
+  "worker_expired_count": 60,
+  "result_accepted_count": 27,
+  "result_ack_received_count": 0,
+  "session_id": "20260728T062024Z_seed42_separate-job-thread",
+  "label": "separate-job-thread",
+  "command": "run_scenarios.py --runs 20 --seed 42 --scenarios job_gt_timeout_reconnect_then_ready_ack job_gt_timeout_reconnect_full_immediate job_gt_timeout_reconnect_then_heartbeat --result-payload-bytes 20971520 --result-policy job-id --threading-mode separate-job-thread --no-monitor --save-traces --trace-label separate-job-thread"
+}
