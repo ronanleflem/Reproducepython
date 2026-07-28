@@ -1,0 +1,22 @@
+{
+  "session_id": "20260727T234621Z_seed42_reconnect-flakiness",
+  "path": "traces/20260727T234621Z_seed42_reconnect-flakiness",
+  "source": "scenarios",
+  "label": "reconnect-flakiness",
+  "created_at": "2026-07-27T23:46:21.675811+00:00",
+  "seed": 42,
+  "command": "run_scenarios.py --runs 20 --seed 42 --scenarios job_gt_timeout_reconnect_then_ready_ack job_gt_timeout_reconnect_full_immediate job_gt_timeout_reconnect_then_heartbeat --result-payload-bytes 20971520 --result-policy job-id --no-monitor --save-traces --trace-label reconnect-flakiness",
+  "config": {
+    "runs": 20,
+    "jitter": 0.0,
+    "result_policy": "job-id",
+    "result_payload_bytes": 20971520,
+    "payload_jitter": 0.15,
+    "scenarios": [
+      "job_gt_timeout_reconnect_full_immediate",
+      "job_gt_timeout_reconnect_then_heartbeat",
+      "job_gt_timeout_reconnect_then_ready_ack"
+    ]
+  },
+  "run_count": 60
+}

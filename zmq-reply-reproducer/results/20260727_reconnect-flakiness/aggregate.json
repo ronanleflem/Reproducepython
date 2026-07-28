@@ -1,0 +1,49 @@
+{
+  "seed": 42,
+  "total_runs": 60,
+  "losses": 40,
+  "replies_never_received": 40,
+  "replies_rejected": 0,
+  "reconnections": 0,
+  "routing_changes": 0,
+  "session_changes": 0,
+  "success_by_strategy": {
+    "manual-reconnect-immediate": 4,
+    "manual-reconnect-heartbeat": 9,
+    "manual-reconnect-ready-ack": 7
+  },
+  "runs_by_strategy": {
+    "manual-reconnect-immediate": 20,
+    "manual-reconnect-heartbeat": 20,
+    "manual-reconnect-ready-ack": 20
+  },
+  "success_by_reconnect_mode": {
+    "full": 20
+  },
+  "runs_by_reconnect_mode": {
+    "full": 60
+  },
+  "success_by_session_validation": {
+    "result_ack": 4,
+    "heartbeat": 9,
+    "ready_ack": 7
+  },
+  "runs_by_session_validation": {
+    "result_ack": 20,
+    "heartbeat": 20,
+    "ready_ack": 20
+  },
+  "success_with_heartbeat": 9,
+  "success_with_ready_ack": 7,
+  "success_with_result_ack": 4,
+  "runs_with_heartbeat_validation": 20,
+  "runs_with_ready_ack_validation": 20,
+  "runs_with_result_ack_validation": 20,
+  "runs_by_transport_case": {
+    "CASE1_send_ok_broker_never_received": 40,
+    "SUCCESS_end_to_end": 20
+  },
+  "session_id": "20260727T234621Z_seed42_reconnect-flakiness",
+  "label": "reconnect-flakiness",
+  "command": "run_scenarios.py --runs 20 --seed 42 --scenarios job_gt_timeout_reconnect_then_ready_ack job_gt_timeout_reconnect_full_immediate job_gt_timeout_reconnect_then_heartbeat --result-payload-bytes 20971520 --result-policy job-id --no-monitor --save-traces --trace-label reconnect-flakiness"
+}
