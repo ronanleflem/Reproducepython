@@ -11,9 +11,18 @@ Prérequis : Python 3.10+ (stdlib uniquement).
 ```bash
 cd mangadex-martial-peak
 python3 download_chapter.py --chapter 1
+python3 download_chapter.py --chapter 1531
 ```
 
-Les pages vont dans `downloads/martial-peak/chapter-1/` (`001.jpg`, …, plus `meta.json`).
+Les pages vont dans `downloads/martial-peak/chapter-<num>/` (`001.jpg`, …, plus `meta.json` local).  
+Les images restent **hors git** (`.gitignore`) ; la PR inclut seulement les métadonnées de vérification dans `verified-downloads/`.
+
+### Chapitres testés
+
+| Chapitre | Pages | ID MangaDex | Notes |
+|----------|------:|-------------|--------|
+| 1 | 20 | `f5cb46fa-eceb-40ae-a5ea-a5c28f47c2a0` | premier chapitre EN |
+| 1531 | 16 | `f9ce4e45-3f65-41f5-b8a2-ae20ab963a27` | titre MD : « Do You Want to Try » |
 
 Options utiles :
 
