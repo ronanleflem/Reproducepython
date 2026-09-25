@@ -15,7 +15,10 @@ python3 download_chapter.py --chapter 1531
 ```
 
 Les pages vont dans `downloads/martial-peak/chapter-<num>/` (`001.jpg`, …, plus `meta.json` local).  
-Les images restent **hors git** (`.gitignore`) ; la PR inclut seulement les métadonnées de vérification dans `verified-downloads/`.
+Les téléchargements complets restent **hors git** (`.gitignore`).
+
+**Échantillon dans le repo** (pour tester le rendu) :  
+[`sample/martial-peak-ch1531-page001.jpg`](sample/martial-peak-ch1531-page001.jpg) — page 1 du chapitre 1531 EN.
 
 ### Chapitres testés
 
