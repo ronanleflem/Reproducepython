@@ -1,4 +1,4 @@
-# Martial Peak — téléchargement MangaDex (v1)
+# Martial Peak — téléchargement MangaDex (v1 + v2)
 
 MangaDex expose une [API publique](https://api.mangadex.org/docs/) : pour **Martial Peak** en anglais, il y a environ **3900+ chapitres** (`translatedLanguage=en`).
 
@@ -35,6 +35,21 @@ Options utiles :
 
 Respecte un petit délai entre les pages (`--delay`, défaut 0,35 s) pour limiter la charge sur l’API.
 
-## v2 (à venir)
+## v2 — plage de chapitres
 
-Téléchargement par lot (plage de chapitres, reprise, parallélisme modéré).
+Un seul appel `/aggregate` pour indexer la plage, puis téléchargement séquentiel avec **reprise** (pages ou chapitres déjà présents ignorés).
+
+```bash
+cd mangadex-martial-peak
+python3 download_batch.py --from 1529 --to 1531
+python3 download_batch.py --from 1531 --to 1531 --dry-run   # liste sans télécharger
+```
+
+Options utiles :
+
+- `--chapter-delay 1.0` — pause entre chapitres (défaut 1 s)
+- `--continue-on-error` — ne pas s’arrêter au premier échec
+- `--no-skip-complete` — forcer même si le dossier semble complet
+- `--data-saver`, `--delay`, `--out`, `--lang` — comme en v1
+
+Code partagé : `mdx_common.py` (API, téléchargement, détection chapitre complet).

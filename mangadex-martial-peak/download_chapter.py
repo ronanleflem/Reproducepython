@@ -8,121 +8,16 @@ Martial Peak (EN) : https://mangadex.org/title/b1461071-bfbb-43e7-a5b6-a7ba59046
 from __future__ import annotations
 
 import argparse
-import json
-import re
 import sys
-import time
-import urllib.error
-import urllib.parse
-import urllib.request
 from pathlib import Path
 
-API_BASE = "https://api.mangadex.org"
-MARTIAL_PEAK_MANGA_ID = "b1461071-bfbb-43e7-a5b6-a7ba5904649f"
-USER_AGENT = "MartialPeakDownloader/1.0 (personal script; +https://mangadex.org)"
-
-
-def api_get(path: str, params: dict | None = None) -> dict:
-    url = f"{API_BASE}{path}"
-    if params:
-        url = f"{url}?{urllib.parse.urlencode(params, doseq=True)}"
-    req = urllib.request.Request(
-        url,
-        headers={"User-Agent": USER_AGENT, "Accept": "application/json"},
-    )
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        return json.loads(resp.read().decode())
-
-
-def resolve_chapter_from_aggregate(
-    manga_id: str, chapter_number: str, lang: str
-) -> tuple[str, str | None]:
-    """Résout numéro → (chapter_id, titre) via /aggregate (rapide même avec 3000+ chapitres)."""
-    payload = api_get(
-        f"/manga/{manga_id}/aggregate",
-        {"translatedLanguage[]": lang},
-    )
-    for vol in payload.get("volumes", {}).values():
-        chapters = vol.get("chapters") or {}
-        entry = chapters.get(chapter_number)
-        if not entry:
-            continue
-        if entry.get("isUnavailable"):
-            continue
-        chapter_id = entry["id"]
-        # Titre non présent dans aggregate ; optionnel via /chapter/{id}
-        return chapter_id, None
-
-    raise SystemExit(
-        f"Aucun chapitre {chapter_number!r} en {lang} pour le manga {manga_id}."
-    )
-
-
-def fetch_chapter_meta(chapter_id: str) -> tuple[str, str | None]:
-    payload = api_get(f"/chapter/{chapter_id}")
-    attrs = payload["data"]["attributes"]
-    return attrs.get("chapter") or "unknown", attrs.get("title") or None
-
-
-def chapter_at_home(chapter_id: str) -> dict:
-    return api_get(f"/at-home/server/{chapter_id}")
-
-
-def safe_dir_name(chapter: str, title: str | None) -> str:
-    label = f"chapter-{chapter}"
-    if title:
-        slug = re.sub(r"[^\w\s-]", "", title, flags=re.UNICODE).strip()
-        slug = re.sub(r"[-\s]+", "-", slug)
-        if slug:
-            label = f"{label}-{slug[:60]}"
-    return label
-
-
-def download_file(url: str, dest: Path) -> None:
-    req = urllib.request.Request(url, headers={"User-Agent": USER_AGENT})
-    with urllib.request.urlopen(req, timeout=120) as resp:
-        dest.write_bytes(resp.read())
-
-
-def download_chapter(
-    chapter_id: str,
-    out_dir: Path,
-    *,
-    data_saver: bool = False,
-    delay_s: float = 0.35,
-) -> int:
-    home = chapter_at_home(chapter_id)
-    base = home["baseUrl"]
-    ch = home["chapter"]
-    hash_ = ch["hash"]
-    files: list[str] = ch["dataSaver"] if data_saver else ch["data"]
-    quality = "data-saver" if data_saver else "data"
-
-    out_dir.mkdir(parents=True, exist_ok=True)
-    meta = {
-        "chapter_id": chapter_id,
-        "hash": hash_,
-        "quality": quality,
-        "pages": len(files),
-        "base_url": base,
-    }
-    (out_dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-
-    for i, name in enumerate(files, start=1):
-        url = f"{base}/{quality}/{hash_}/{name}"
-        ext = Path(name).suffix or ".jpg"
-        dest = out_dir / f"{i:03d}{ext}"
-        if dest.exists():
-            print(f"  skip {dest.name} (déjà présent)")
-            continue
-        print(f"  {dest.name} …")
-        try:
-            download_file(url, dest)
-        except urllib.error.HTTPError as e:
-            raise SystemExit(f"Échec téléchargement page {i}: {e.code} {url}") from e
-        time.sleep(delay_s)
-
-    return len(files)
+from mdx_common import (
+    MARTIAL_PEAK_MANGA_ID,
+    download_chapter,
+    fetch_chapter_meta,
+    resolve_chapter_from_aggregate,
+    safe_dir_name,
+)
 
 
 def main() -> None:
@@ -132,7 +27,7 @@ def main() -> None:
     parser.add_argument(
         "--manga-id",
         default=MARTIAL_PEAK_MANGA_ID,
-        help=f"UUID du titre (défaut: Martial Peak).",
+        help="UUID du titre (défaut: Martial Peak).",
     )
     parser.add_argument(
         "--chapter",
@@ -176,9 +71,12 @@ def main() -> None:
         if args.chapter:
             chapter_num = args.chapter
     else:
-        chapter_id, _ = resolve_chapter_from_aggregate(
-            args.manga_id, args.chapter, args.lang
-        )
+        try:
+            chapter_id, _ = resolve_chapter_from_aggregate(
+                args.manga_id, args.chapter, args.lang
+            )
+        except LookupError as e:
+            raise SystemExit(str(e)) from e
         chapter_num, title = fetch_chapter_meta(chapter_id)
         if not chapter_num or chapter_num == "unknown":
             chapter_num = args.chapter
