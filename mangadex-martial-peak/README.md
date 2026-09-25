@@ -14,8 +14,12 @@ python3 download_chapter.py --chapter 1
 python3 download_chapter.py --chapter 1531
 ```
 
-Les pages vont dans `downloads/martial-peak/chapter-<num>/` (`001.jpg`, …, plus `meta.json` local).  
-Les téléchargements complets restent **hors git** (`.gitignore`).
+Chaque chapitre téléchargé produit :
+
+- un dossier `downloads/martial-peak/chapter-<num>-<titre>/` (`001.jpg`, …, `meta.json`) — utile pour la reprise ;
+- un **`chapter-<num>-<titre>.zip`** au même niveau, avec les JPG à la racine du zip (+ `meta.json`).
+
+Les téléchargements restent **hors git** (`.gitignore`). Option `--no-zip` pour désactiver le zip.
 
 **Échantillon dans le repo** (pour tester le rendu) :  
 [`sample/martial-peak-ch1531-page001.jpg`](sample/martial-peak-ch1531-page001.jpg) — page 1 du chapitre 1531 EN.
@@ -50,6 +54,6 @@ Options utiles :
 - `--chapter-delay 1.0` — pause entre chapitres (défaut 1 s)
 - `--continue-on-error` — ne pas s’arrêter au premier échec
 - `--no-skip-complete` — forcer même si le dossier semble complet
-- `--data-saver`, `--delay`, `--out`, `--lang` — comme en v1
+- `--data-saver`, `--delay`, `--out`, `--lang`, `--no-zip` — comme en v1
 
 Code partagé : `mdx_common.py` (API, téléchargement, détection chapitre complet).

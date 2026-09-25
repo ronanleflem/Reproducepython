@@ -13,6 +13,7 @@ from pathlib import Path
 
 from mdx_common import (
     MARTIAL_PEAK_MANGA_ID,
+    chapter_zip_path,
     download_chapter,
     fetch_chapter_meta,
     resolve_chapter_from_aggregate,
@@ -60,6 +61,11 @@ def main() -> None:
         default=0.35,
         help="Pause entre chaque page (respect rate-limit MangaDex).",
     )
+    parser.add_argument(
+        "--no-zip",
+        action="store_true",
+        help="Ne pas créer de .zip après le téléchargement.",
+    )
     args = parser.parse_args()
 
     if not args.chapter_id and not args.chapter:
@@ -88,8 +94,12 @@ def main() -> None:
         dest,
         data_saver=args.data_saver,
         delay_s=args.delay,
+        make_zip=not args.no_zip,
     )
-    print(f"Terminé: {n} page(s) dans {dest}")
+    zip_msg = ""
+    if not args.no_zip:
+        zip_msg = f", zip: {chapter_zip_path(dest)}"
+    print(f"Terminé: {n} page(s) dans {dest}{zip_msg}")
 
 
 if __name__ == "__main__":

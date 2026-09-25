@@ -14,10 +14,12 @@ from pathlib import Path
 
 from mdx_common import (
     MARTIAL_PEAK_MANGA_ID,
-    chapter_dir_complete,
+    chapter_ready,
     chapter_sort_key,
+    chapter_zip_path,
     download_chapter,
     fetch_chapter_meta,
+    finalize_chapter,
     load_aggregate_chapters,
     safe_dir_name,
 )
@@ -45,12 +47,17 @@ def find_existing_dir(out_root: Path, chapter_num: str) -> Path | None:
     exact = out_root / prefix
     if exact.is_dir():
         return exact
-    matches = sorted(out_root.glob(f"{prefix}-*"))
-    if len(matches) == 1:
-        return matches[0]
-    if len(matches) > 1:
-        return matches[0]
-    return None
+    matches = sorted(p for p in out_root.glob(f"{prefix}-*") if p.is_dir())
+    return matches[0] if matches else None
+
+
+def find_existing_zip(out_root: Path, chapter_num: str) -> Path | None:
+    prefix = f"chapter-{chapter_num}"
+    exact = out_root / f"{prefix}.zip"
+    if exact.is_file():
+        return exact
+    matches = sorted(out_root.glob(f"{prefix}-*.zip"))
+    return matches[0] if matches else None
 
 
 def main() -> None:
@@ -89,6 +96,11 @@ def main() -> None:
         action="store_true",
         help="Lister les chapitres sans télécharger.",
     )
+    parser.add_argument(
+        "--no-zip",
+        action="store_true",
+        help="Ne pas créer de fichier .zip par chapitre.",
+    )
     args = parser.parse_args()
 
     print(f"Index aggregate ({args.lang})…")
@@ -106,14 +118,24 @@ def main() -> None:
     for i, (chapter_num, chapter_id) in enumerate(planned, start=1):
         print(f"\n[{i}/{len(planned)}] Chapitre {chapter_num} ({chapter_id})")
         existing = find_existing_dir(args.out, chapter_num)
+        existing_zip = find_existing_zip(args.out, chapter_num)
+        if existing and not existing_zip:
+            existing_zip = chapter_zip_path(existing)
+        if not args.no_skip_complete and chapter_ready(existing, existing_zip):
+            target = existing_zip or (chapter_zip_path(existing) if existing else None)
+            print(f"  skip (complet) → {target or existing}")
+            skipped += 1
+            continue
         if (
             not args.no_skip_complete
             and existing
-            and chapter_dir_complete(existing)
+            and not args.no_zip
         ):
-            print(f"  skip (complet) → {existing}")
-            skipped += 1
-            continue
+            zp = finalize_chapter(existing, make_zip=True)
+            if zp and chapter_ready(existing, zp):
+                print(f"  skip (zip créé) → {zp}")
+                skipped += 1
+                continue
 
         if args.dry_run:
             print("  dry-run")
@@ -123,7 +145,7 @@ def main() -> None:
         try:
             _, title = fetch_chapter_meta(chapter_id)
             dest = args.out / safe_dir_name(chapter_num, title)
-            if existing and existing != dest and chapter_dir_complete(existing):
+            if existing and existing.is_dir():
                 dest = existing
             print(f"  → {dest}")
             download_chapter(
@@ -131,6 +153,7 @@ def main() -> None:
                 dest,
                 data_saver=args.data_saver,
                 delay_s=args.delay,
+                make_zip=not args.no_zip,
             )
             ok += 1
         except Exception as e:
